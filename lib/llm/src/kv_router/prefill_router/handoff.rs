@@ -103,8 +103,10 @@ impl PrefillTask {
     }
 
     /// Observe prefill failures both during decode dispatch and while streaming.
-    /// Successful prefill does not delay tokens; a successful decode terminal is
-    /// held until prefill finishes so a late failure cannot follow success.
+    /// Decode items, including a successful terminal, are forwarded without waiting for
+    /// prefill. A successful decode terminal means the request succeeded: decode cannot
+    /// succeed without its KV, so a later prefill failure is only logged, and the stream
+    /// closes once decode and prefill finish.
     /// `output` sends prefill's output into the stream as soon as prefill
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
     pub(super) async fn forward_decode(
@@ -225,7 +227,7 @@ impl PrefillTask {
                         let terminal = output.as_ref().is_none_or(|output| {
                             output.data.as_ref().is_some_and(|data| data.finish_reason.is_some())
                         });
-                        if terminal {
+                        if terminal && (emit || output.is_none()) {
                             match completion.as_mut().await {
                                 Ok(prefill) => if emit && let Some(item) = output_item(prefill) {
                                     yield item;
@@ -243,6 +245,12 @@ impl PrefillTask {
                             None => return,
                         }
                         if terminal {
+                            while let Some(output) = response.next().await {
+                                yield output;
+                            }
+                            if !emit {
+                                let _ = completion.await;
+                            }
                             return;
                         }
                     }
@@ -356,18 +364,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tokens_flow_while_prefill_is_pending_but_success_waits() {
+    async fn tokens_flow_while_prefill_is_pending_but_close_waits() {
         let (tx, task) = pending_prefill();
         let context = Arc::new(Controller::default());
         let token = LLMEngineOutput {
             token_ids: vec![42],
             ..Default::default()
         };
+        let (decode_tx, decode_rx) = futures::channel::mpsc::unbounded();
         let decode: ManyOut<Annotated<LLMEngineOutput>> = ResponseStream::new(
-            Box::pin(stream::iter([
-                Annotated::from_data(token),
-                Annotated::from_data(LLMEngineOutput::length()),
-            ])),
+            Box::pin(
+                stream::iter([
+                    Annotated::from_data(token.clone()),
+                    Annotated::from_data(LLMEngineOutput::length()),
+                ])
+                .chain(decode_rx),
+            ),
             context.clone(),
         );
         let mut response = task
@@ -380,18 +392,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [42]);
-        assert!(response.next().now_or_never().is_none());
-        tx.send(Ok(None)).unwrap();
+        let terminal = response.next().now_or_never().flatten().unwrap();
         assert_eq!(
-            response.next().await.unwrap().data.unwrap().finish_reason,
+            terminal.data.unwrap().finish_reason,
             Some(FinishReason::Length)
         );
+        assert!(response.next().now_or_never().is_none());
+        tx.send(Ok(None)).unwrap();
+        decode_tx
+            .unbounded_send(Annotated::from_data(token))
+            .unwrap();
+        assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [42]);
+        assert!(response.next().now_or_never().is_none());
+        drop(decode_tx);
         assert!(response.next().await.is_none());
         assert!(!context.is_stopped());
     }
 
     #[tokio::test]
-    async fn late_prefill_failure_replaces_decode_success() {
+    async fn late_prefill_failure_does_not_follow_decode_success() {
         let (tx, task) = pending_prefill();
         let context = Arc::new(Controller::default());
         let decode: ManyOut<Annotated<LLMEngineOutput>> = ResponseStream::new(
@@ -409,18 +428,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let terminal = response.next().now_or_never().flatten().unwrap();
+        assert_eq!(
+            terminal.data.unwrap().finish_reason,
+            Some(FinishReason::Length)
+        );
         assert!(response.next().now_or_never().is_none());
         tx.send(failure()).unwrap();
-        assert!(
-            response
-                .next()
-                .await
-                .unwrap()
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("prefill connection lost")
-        );
         assert!(response.next().await.is_none());
     }
 
@@ -621,6 +635,7 @@ mod tests {
                 .finish_reason
                 .is_some()
         );
+        assert!(response.next().await.is_none());
     }
 
     /// Preserve prefill metadata and failures without polling an ended decode stream again.
