@@ -761,6 +761,132 @@ def test_plugin_subscribe_with_a_context_publishes_live(
     callbacks.on_complete()
 
 
+@pytest.mark.parametrize("search_fails", [False, True], ids=["complete", "failure"])
+def test_pinned_aisimulate_dispatches_the_complete_lifecycle_to_dgdr_run(
+    tmp_path: Path,
+    renders: list[str],
+    fake_search_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    search_fails: bool,
+) -> None:
+    import aisimulate.recommend as recommendation
+    from aisimulate.config import CoreRecommendationConfig
+    from aisimulate.sweeper import search
+
+    config = CoreRecommendationConfig.model_validate(
+        {
+            "engine": {
+                "model": "openai/gpt-oss-120b",
+                "hardware": "gb300",
+                "backend": "vllm",
+                "mode": "aggregated",
+                "context_length": 16384,
+                "workers": {"aggregated": {}},
+            },
+            "traffic": {
+                "source": {
+                    "type": "synthetic",
+                    "input_tokens": 10240,
+                    "output_tokens": 1024,
+                },
+                "load": {
+                    "type": "concurrency",
+                    "concurrency": {"choices": [8]},
+                },
+                "stop": {"requests_per_load_unit": 1},
+            },
+            "optimization": {
+                "target": "throughput_per_gpu",
+                "constraints": {
+                    "min_candidate_gpus": 1,
+                    "max_candidate_gpus": 8,
+                },
+            },
+            "optimizer": {"parallelism": 1, "max_trials": 1},
+        }
+    )
+    output_config = {
+        **PLUGIN_CONFIG,
+        "snapshot_dir": str(tmp_path),
+        # Keep candidate and round updates buffered so their presence after a
+        # successful search proves that on_complete forced the final live flush.
+        "snapshot_interval_seconds": 3600,
+    }
+    result = _final_result(1)
+    search_error = RuntimeError("search crashed")
+
+    # Use the real pinned AISimulate lifecycle dispatcher around a deterministic search.
+    monkeypatch.setattr(
+        recommendation, "resolve_budget", lambda *args, **kwargs: {"cpu_limit": 1}
+    )
+
+    class LifecycleSweeper:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def run(
+            self,
+            smart: Any,
+            *,
+            top_n: int | None,
+            on_candidate: Any = None,
+            on_round: Any = None,
+        ) -> Any:
+            del smart, top_n
+            assert on_candidate is not None
+            assert on_round is not None
+            on_candidate(record("a", 9.0))
+            on_round(3, [])
+            if search_fails:
+                raise search_error
+            return result
+
+    monkeypatch.setattr(search, "Sweeper", LifecycleSweeper)
+
+    # A failed search must dispatch on_failure and leave a terminal failed snapshot.
+    if search_fails:
+        with pytest.raises(RuntimeError, match="search crashed") as raised:
+            recommendation._run_recommendation(
+                config,
+                stack="engine",
+                runner_factory=object(),
+                output_configs={"dgdr_run": output_config},
+                output_adapters={"dgdr_run": create_adapter()},
+            )
+        assert raised.value is search_error
+        snapshot = load(tmp_path)
+        assert snapshot["run"] == {
+            "phase": "Failed",
+            "terminal": True,
+            "message": "search crashed",
+            "error": "RuntimeError",
+        }
+        assert snapshot["progress"] == {"round": 3, "evaluated": 1}
+        assert tags(snapshot) == ["a"]
+        return
+
+    # A successful search must dispatch on_complete before the final writer takes over.
+    returned = recommendation._run_recommendation(
+        config,
+        stack="engine",
+        runner_factory=object(),
+        output_configs={"dgdr_run": output_config},
+        output_adapters={"dgdr_run": create_adapter()},
+    )
+    assert returned is result
+    completed = load(tmp_path)
+    assert completed["run"] == {"phase": "Running", "terminal": False}
+    assert completed["progress"] == {"round": 3, "evaluated": 1}
+    assert tags(completed) == ["a"]
+
+    # The separate final writer publishes the authoritative terminal selection.
+    create_adapter().write(output_config, result=returned, output_dir=tmp_path)
+    terminal = load(tmp_path)
+    assert terminal["run"] == {"phase": "Succeeded", "terminal": True}
+    assert terminal["progress"] == {"round": 3, "evaluated": 1}
+    assert tags(terminal) == ["a"]
+
+
 def test_plugin_subscribe_without_context_or_snapshot_dir_only_validates(
     tmp_path: Path,
 ) -> None:
