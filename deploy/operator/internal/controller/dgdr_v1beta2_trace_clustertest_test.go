@@ -325,7 +325,7 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2RefusesATraceSymlinkThatLeave
 }
 
 // startClusterTestDGDRV1beta2Controllers starts the production Request and Run controllers for env,
-// with GPU discovery reporting the node shape the scenarios' explicit hardware names.
+// with GPU discovery reporting the inventory the candidate scenarios use.
 func startClusterTestDGDRV1beta2Controllers(t *testing.T, env *clusterenv.TestEnv, plannerImage, operatorImage string) {
 	t.Helper()
 	operatorVersion, err := clusterTestOperatorVersion()
@@ -334,13 +334,14 @@ func startClusterTestDGDRV1beta2Controllers(t *testing.T, env *clusterenv.TestEn
 	require.NoError(t, err)
 	dynamoVersion := fmt.Sprintf("%d.%d.%d", parsedOperatorVersion.Major(), parsedOperatorVersion.Minor(), parsedOperatorVersion.Patch())
 
-	t.Log("Provide the Run controller the discovered node shape represented by the explicit Request hardware")
+	t.Log("Provide the Run controller the same heterogeneous inventory resolved by Request admission")
 	hardwareCache := gpu.NewGPUDiscoveryCache()
 	hardwareCache.Set(nvidiacomv1beta1.GPUSKUTypeH200SXM, &gpu.GPUInfo{
-		System:        nvidiacomv1beta1.GPUSKUTypeH200SXM,
-		GPUsPerNode:   8,
-		NodesWithGPUs: 1,
-		TotalGPUs:     8,
+		System:            nvidiacomv1beta1.GPUSKUTypeH200SXM,
+		GPUsPerNode:       8,
+		NodesWithGPUs:     2,
+		TotalGPUs:         12,
+		SelectedShapeGPUs: 8,
 	}, time.Hour)
 
 	t.Log("Start the production Request, Run, AISimulate Job, and publisher chain")
