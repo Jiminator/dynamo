@@ -1129,7 +1129,9 @@ Before you create the request:
 - Finish writing the file. `path` names one file relative to the claim root; directories and globs
   are not expanded. Every Run of the request reads the file when its Job starts, so do not rewrite
   it afterwards. To replay several rolled `jsonl_gz` segments, concatenate them into one `.jsonl.gz`
-  file. A symlink to another file in the claim works; a symlink that leaves the claim does not.
+  file. A relative symlink to another file in the claim works. An absolute symlink does not,
+  because the kubelet resolves it on the node rather than inside the claim, and neither does a
+  symlink that leaves the claim.
 - Make the file readable by others (for example, mode `0644` in `0755` directories) or by group
   `65532`, which the Job's pod has as a supplemental group. The pod sets no `fsGroup`, so neither
   the kubelet nor a CSI driver changes the ownership or permissions of anything on the claim.
@@ -1160,14 +1162,14 @@ never read the trace:
 
 - The claim does not exist, is being deleted, is a block volume, or has lost its volume. The
   operator checks this before it creates the Job, and again whenever the claim or the Job's pod
-  changes until the pod is scheduled. Once a scheduled pod uses the claim, Kubernetes keeps the
-  claim until the pod ends.
-- The kubelet cannot mount the trace file, for example because it does not exist or is a symlink
-  that leaves the claim.
+  changes until the AISimulate container starts. Once a pod is scheduled, Kubernetes keeps a claim
+  being deleted until the pod ends, and the pod can still mount it.
+- The kubelet cannot mount the trace file, for example because it does not exist, is an absolute
+  symlink, or is a symlink that leaves the claim.
 
-The operator deletes such a Job before it fails the Run. A claim that is still `Pending`, such as
-one that waits for its first consumer, is accepted. The request starts one Run per
-`metadata.generation`, so after you fix the claim or the file, change the request's `spec` to
+The operator records the failure on the Run and then deletes such a Job. A claim that is still
+`Pending`, such as one that waits for its first consumer, is accepted. The request starts one Run
+per `metadata.generation`, so after you fix the claim or the file, change the request's `spec` to
 start a new Run.
 
 ```bash

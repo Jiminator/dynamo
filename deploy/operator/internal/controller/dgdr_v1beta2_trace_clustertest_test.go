@@ -36,16 +36,18 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// The trace scenarios read their file from this claim and path, which their input.yaml names. The
-// writer gives the file an owner the Job's users do not have and the trace group, so the sweeper can
-// read it only through the supplemental group of the Run Job's pod.
+// The writer gives a trace file an owner the Job's users do not have and the trace group, so the
+// sweeper can read it only through the supplemental group of the Run Job's pod.
 const (
-	clusterTestTraceClaim = "request-traces"
-	clusterTestTracePath  = "retune/w-1.jsonl.gz"
-	clusterTestTraceUID   = 4321
-	clusterTestTraceGID   = dgdrRunTraceGroup
-	clusterTestTraceMode  = "640"
+	clusterTestTraceUID  = 4321
+	clusterTestTraceGID  = dgdrRunTraceGroup
+	clusterTestTraceMode = "640"
 )
+
+// clusterTestTraceFile is the claim and claim-relative path a trace Request reads.
+type clusterTestTraceFile struct {
+	claim, path string
+}
 
 // clusterTestTraceWriter gzips the fixture to the claim file and gives it the requested owner and mode.
 const clusterTestTraceWriter = `
@@ -76,10 +78,10 @@ with open("/dev/termination-log", "w") as log:
     log.write(f"{st.st_uid} {st.st_gid} {st.st_mode & 0o7777:o} {digest}")
 `
 
-// createClusterTestTraceClaim creates a static filesystem claim, named clusterTestTraceClaim, in
-// env's namespace. Kind installs no dynamic provisioner the test may rely on, so the claim binds a
-// PersistentVolume of its own on one node, which is deleted with the test.
-func createClusterTestTraceClaim(t *testing.T, env *clusterenv.TestEnv) {
+// createClusterTestTraceClaim creates the static filesystem claim of trace in env's namespace. Kind
+// installs no dynamic provisioner the test may rely on, so the claim binds a PersistentVolume of its
+// own on one node, which is deleted with the test.
+func createClusterTestTraceClaim(t *testing.T, env *clusterenv.TestEnv, trace clusterTestTraceFile) {
 	t.Helper()
 	ctx := t.Context()
 
@@ -97,7 +99,7 @@ func createClusterTestTraceClaim(t *testing.T, env *clusterenv.TestEnv) {
 			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("16Mi")},
 			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
-			ClaimRef:                      &corev1.ObjectReference{Namespace: env.Namespace(), Name: clusterTestTraceClaim},
+			ClaimRef:                      &corev1.ObjectReference{Namespace: env.Namespace(), Name: trace.claim},
 			PersistentVolumeSource: corev1.PersistentVolumeSource{HostPath: &corev1.HostPathVolumeSource{
 				Path: "/var/local/dynamo-clustertest/" + env.Namespace(),
 				Type: ptr.To(corev1.HostPathDirectoryOrCreate),
@@ -116,7 +118,7 @@ func createClusterTestTraceClaim(t *testing.T, env *clusterenv.TestEnv) {
 		}
 	})
 	claim := &corev1.PersistentVolumeClaim{
-		Name: clusterTestTraceClaim, Namespace: env.Namespace(),
+		Name: trace.claim, Namespace: env.Namespace(),
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			VolumeMode:       ptr.To(corev1.PersistentVolumeFilesystem),
@@ -130,13 +132,13 @@ func createClusterTestTraceClaim(t *testing.T, env *clusterenv.TestEnv) {
 	require.NoError(t, env.Client().Create(ctx, claim))
 }
 
-// runClusterTestTraceJob runs script with args in image, with the trace claim mounted at /claim
-// (read-only unless writable) and the files of configMap, if named, at /fixture. It waits for the
-// Job to succeed and returns its termination message.
+// runClusterTestTraceJob runs script with args in image, with claim mounted at /claim (read-only
+// unless writable) and the files of configMap, if named, at /fixture. It waits for the Job to
+// succeed and returns its termination message.
 func runClusterTestTraceJob(
 	t *testing.T,
 	env *clusterenv.TestEnv,
-	name, image, configMap string,
+	name, image, claim, configMap string,
 	writable bool,
 	script string,
 	args ...string,
@@ -157,7 +159,7 @@ func runClusterTestTraceJob(
 		}},
 		Volumes: []corev1.Volume{{
 			Name:                  "claim",
-			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: clusterTestTraceClaim, ReadOnly: !writable},
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim, ReadOnly: !writable},
 		}},
 	}
 	if configMap != "" {
@@ -191,38 +193,38 @@ func runClusterTestTraceJob(
 	return terminated.Message
 }
 
-// writeClusterTestTrace gzips the fixture at path into the trace claim and returns the file's owner,
-// mode and digest as the claim holds it.
-func writeClusterTestTrace(t *testing.T, env *clusterenv.TestEnv, path, image string) string {
+// writeClusterTestTrace gzips the fixture at fixture into trace and returns the file's owner, mode
+// and digest as the claim holds it.
+func writeClusterTestTrace(t *testing.T, env *clusterenv.TestEnv, trace clusterTestTraceFile, fixture, image string) string {
 	t.Helper()
 	ctx := t.Context()
 
 	t.Log("Carry the checked-in trace fixture into the cluster")
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(fixture)
 	require.NoError(t, err)
 	require.NoError(t, env.Client().Create(ctx, &corev1.ConfigMap{
 		Name: "trace-fixture", Namespace: env.Namespace(),
 		Data: map[string]string{"trace.jsonl": string(content)},
 	}))
 
-	runClusterTestTraceJob(t, env, "trace-writer", image, "trace-fixture", true, clusterTestTraceWriter,
-		"/fixture/trace.jsonl", filepath.Join("/claim", clusterTestTracePath),
+	runClusterTestTraceJob(t, env, "trace-writer", image, trace.claim, "trace-fixture", true, clusterTestTraceWriter,
+		"/fixture/trace.jsonl", filepath.Join("/claim", trace.path),
 		fmt.Sprint(clusterTestTraceUID), fmt.Sprint(clusterTestTraceGID), clusterTestTraceMode)
-	return statClusterTestTrace(t, env, "trace-before", image)
+	return statClusterTestTrace(t, env, trace, "trace-before", image)
 }
 
-// statClusterTestTrace returns the trace file's owner, mode and digest as the claim holds it, read
-// by a Job named name.
-func statClusterTestTrace(t *testing.T, env *clusterenv.TestEnv, name, image string) string {
+// statClusterTestTrace returns the owner, mode and digest of trace as its claim holds it, read by a
+// Job named name.
+func statClusterTestTrace(t *testing.T, env *clusterenv.TestEnv, trace clusterTestTraceFile, name, image string) string {
 	t.Helper()
-	stat := runClusterTestTraceJob(t, env, name, image, "", false, clusterTestTraceStat,
-		filepath.Join("/claim", clusterTestTracePath))
+	stat := runClusterTestTraceJob(t, env, name, image, trace.claim, "", false, clusterTestTraceStat,
+		filepath.Join("/claim", trace.path))
 	require.Regexp(t, fmt.Sprintf(`^%d %d %s [0-9a-f]{64}$`, clusterTestTraceUID, clusterTestTraceGID, clusterTestTraceMode), stat)
 	return stat
 }
 
-// requireClusterTestTraceInput checks that run replayed the trace file through its fixed mount path.
-func requireClusterTestTraceInput(t *testing.T, run *nvidiacomv1beta2.DynamoGraphDeploymentRun) {
+// requireClusterTestTraceInput checks that run replayed trace through its fixed mount path.
+func requireClusterTestTraceInput(t *testing.T, run *nvidiacomv1beta2.DynamoGraphDeploymentRun, trace clusterTestTraceFile) {
 	t.Helper()
 	require.NotNil(t, run.Status.AISimulate, "completed Run has no AISimulate status")
 	var input struct {
@@ -233,7 +235,7 @@ func requireClusterTestTraceInput(t *testing.T, run *nvidiacomv1beta2.DynamoGrap
 	}
 	require.NoError(t, yaml.Unmarshal(run.Status.AISimulate.Input.Raw, &input))
 	require.Equal(t, map[string]any{
-		"type": "trace", "format": "dynamo", "paths": []any{aisimulate.TracePath(clusterTestTracePath)},
+		"type": "trace", "format": "dynamo", "paths": []any{aisimulate.TracePath(trace.path)},
 	}, input.Traffic.Source)
 	require.Equal(t, "trace_timestamps", input.Traffic.Load["type"])
 }
@@ -247,17 +249,33 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2RefusesATraceSymlinkThatLeave
 	env := clusterTestEnv.RunT(t)
 	env.BlockReplicaSets()
 
-	t.Log("Place a symlink at the claim file that points at a file outside the claim")
-	createClusterTestTraceClaim(t, env)
-	runClusterTestTraceJob(t, env, "trace-linker", plannerImage, "", true, clusterTestTraceLinker,
-		filepath.Join("/claim", clusterTestTracePath), "/etc/passwd")
+	t.Log("Place a symlink at the trace path that points at a file outside the claim")
+	trace := clusterTestTraceFile{claim: "linked-traces", path: "retune/escape.jsonl.gz"}
+	createClusterTestTraceClaim(t, env, trace)
+	runClusterTestTraceJob(t, env, "trace-linker", plannerImage, trace.claim, "", true, clusterTestTraceLinker,
+		filepath.Join("/claim", trace.path), "/etc/passwd")
 
-	t.Log("Apply the trace scenario's Request through production admission")
-	data, err := os.ReadFile(filepath.Join("testdata/dgdr-v1beta2/vllm-trace", "input.yaml"))
-	require.NoError(t, err)
-	request := &nvidiacomv1beta2.DynamoGraphDeploymentRequest{}
-	require.NoError(t, yaml.Unmarshal(data, request))
-	request.Name, request.Namespace = "aisimulate-trace-symlink", env.Namespace()
+	t.Log("Apply a Request that reads the linked trace path through production admission")
+	request := &nvidiacomv1beta2.DynamoGraphDeploymentRequest{
+		Name: "aisimulate-trace-symlink", Namespace: env.Namespace(),
+		Spec: nvidiacomv1beta2.DynamoGraphDeploymentRequestSpec{
+			DynamoGraphDeploymentRequestNativeSpec: nvidiacomv1beta2.DynamoGraphDeploymentRequestNativeSpec{
+				NativeSearchInput: nvidiacomv1beta2.NativeSearchInput{
+					Model:    &nvidiacomv1beta2.ModelSpec{Name: "Qwen/Qwen3-32B"},
+					Backends: []nvidiacomv1beta2.Backend{nvidiacomv1beta2.BackendVLLM},
+					Hardware: &nvidiacomv1beta2.HardwareSpec{GPU: &nvidiacomv1beta2.GPUHardwareSpec{
+						SKU: new("h200_sxm"), Budget: new(int32(2)),
+					}},
+					Workload: &nvidiacomv1beta2.WorkloadSpec{Trace: &nvidiacomv1beta2.TraceWorkloadSpec{
+						Format: nvidiacomv1beta2.TraceFormatDynamo,
+						Source: nvidiacomv1beta2.TraceSourceSpec{PVC: &nvidiacomv1beta2.TracePVCSource{
+							ClaimName: trace.claim, Path: trace.path,
+						}},
+					}},
+				},
+			},
+		},
+	}
 	require.NoError(t, env.Client().Create(ctx, request))
 
 	t.Log("Watch every Run transition before starting the production controllers")

@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/yaml"
 )
 
 var clusterTestEnv *clusterenv.Env
@@ -341,12 +342,24 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 			t.Log("Allow the AISimulate Job Pod to run while preventing unrelated ReplicaSet workloads")
 			env.BlockReplicaSets()
 
-			t.Log("Write a trace scenario's trace to its claim before the Request names it")
-			tracePath := filepath.Join(scenarioDir, "trace.jsonl")
+			t.Log("Write a trace scenario's trace to the claim file its Request names before applying it")
+			traceFixture := filepath.Join(scenarioDir, "trace.jsonl")
+			var trace clusterTestTraceFile
 			traceBefore := ""
-			if _, err := os.Stat(tracePath); err == nil {
-				createClusterTestTraceClaim(t, env)
-				traceBefore = writeClusterTestTrace(t, env, tracePath, plannerImage)
+			if _, err := os.Stat(traceFixture); err == nil {
+				scenario := &nvidiacomv1beta2.DynamoGraphDeploymentRequest{}
+				data, err := os.ReadFile(input)
+				require.NoError(t, err)
+				require.NoError(t, yaml.Unmarshal(data, scenario))
+				require.NotNil(t, scenario.Spec.Workload, "trace scenario input has no workload")
+				require.NotNil(t, scenario.Spec.Workload.Trace, "trace scenario input has no trace workload")
+				require.NotNil(t, scenario.Spec.Workload.Trace.Source.PVC, "trace scenario input has no trace claim")
+				trace = clusterTestTraceFile{
+					claim: scenario.Spec.Workload.Trace.Source.PVC.ClaimName,
+					path:  scenario.Spec.Workload.Trace.Source.PVC.Path,
+				}
+				createClusterTestTraceClaim(t, env, trace)
+				traceBefore = writeClusterTestTrace(t, env, trace, traceFixture, plannerImage)
 			}
 
 			t.Log("Apply the native v1beta2 Request through production admission")
@@ -439,8 +452,8 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 
 			if traceBefore != "" {
 				t.Log("The Run replayed the mounted trace file and left its contents, owner and mode unchanged")
-				requireClusterTestTraceInput(t, &completedRun)
-				require.Equal(t, traceBefore, statClusterTestTrace(t, env, "trace-after", plannerImage))
+				requireClusterTestTraceInput(t, &completedRun, trace)
+				require.Equal(t, traceBefore, statClusterTestTrace(t, env, trace, "trace-after", plannerImage))
 			}
 		})
 	}

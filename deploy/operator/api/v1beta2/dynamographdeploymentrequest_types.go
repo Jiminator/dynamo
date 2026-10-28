@@ -154,7 +154,8 @@ const (
 // TracePVCSource names one trace file on a PersistentVolumeClaim in the Request namespace.
 type TracePVCSource struct {
 	// ClaimName is the PersistentVolumeClaim, in the Request namespace, that holds the trace.
-	// The Run Job mounts it read-only, and only into the AISimulate container.
+	// The Run Job mounts only the trace file from it, read-only, and only into the AISimulate
+	// container.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
@@ -217,9 +218,10 @@ type WorkloadSpec struct {
 	Static *StaticWorkloadSpec `json:"static,omitempty"`
 
 	// Trace replays a recorded request trace from a PersistentVolumeClaim in the Request
-	// namespace. Admission supplies no static default when it is set. The Run Job mounts the
-	// claim read-only at /var/run/aisimulate/trace, and spec.aisimulate.inputOverrides cannot
-	// change traffic.source.type, format or paths.
+	// namespace. Admission supplies no static default when it is set. The Run Job mounts only the
+	// trace file, read-only through a subPath of the claim, at /var/run/aisimulate/trace/trace.jsonl,
+	// or trace.jsonl.gz when the path ends in .gz, and spec.aisimulate.inputOverrides cannot change
+	// traffic.source.type, format or paths.
 	// +optional
 	Trace *TraceWorkloadSpec `json:"trace,omitempty"`
 }
@@ -303,10 +305,10 @@ type AISimulateSpec struct {
 	// immutable snapshot. When spec.workload.trace is set, traffic and
 	// traffic.source must remain objects, and the trace owns traffic.source.type,
 	// format, and paths the same way: Request admission rejects them, and the Run
-	// controller enforces the typed values. A trace also takes no traffic.stop
-	// request or session count. The operator runs the AISimulate version from its
-	// configured planner image; Requests and Runs cannot select a different image
-	// or version.
+	// controller enforces the typed values. Other traffic overrides are AISimulate
+	// input, which AISimulate validates when the Run's Job starts. The operator runs
+	// the AISimulate version from its configured planner image; Requests and Runs
+	// cannot select a different image or version.
 	// +optional
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Type=object

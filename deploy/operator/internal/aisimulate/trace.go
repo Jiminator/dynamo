@@ -28,8 +28,8 @@ const TraceMountPath = "/var/run/aisimulate/trace"
 
 // TracePath is where the Run Job mounts the trace file at claimPath: one fixed file under
 // TraceMountPath. The Job mounts only that file, through a subPath of the claim, so the kubelet
-// resolves claimPath and refuses a symlink that leaves the claim. The name keeps the ".gz" suffix,
-// by which AISimulate recognizes gzip-compressed JSON Lines.
+// resolves claimPath and refuses a symlink that resolves outside the claim. The name keeps the
+// ".gz" suffix, by which AISimulate recognizes gzip-compressed JSON Lines.
 func TracePath(claimPath string) string {
 	if strings.HasSuffix(claimPath, ".gz") {
 		return TraceMountPath + "/trace.jsonl.gz"

@@ -3259,7 +3259,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `inputOverrides` _[RawExtension](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#rawextension-runtime-pkg)_ | InputOverrides is an RFC 7386 JSON Merge Patch over the input lowered from<br />the typed fields. It uses the upstream AISimulate JSON contract, including<br />snake_case names. Values here take precedence, and null deletes a lowered<br />field. The dgdr_run member must remain an object, and its operator-owned<br />transport, identity, and runtime fields name, max_candidates, snapshot_dir,<br />runtime_image, runtime_version_override, derive_runtime_images,<br />num_gpus_per_node, and namespace are operator-owned. Request admission<br />rejects them, and the Run controller enforces its values while lowering the<br />immutable snapshot. When spec.workload.trace is set, traffic and<br />traffic.source must remain objects, and the trace owns traffic.source.type,<br />format, and paths the same way: Request admission rejects them, and the Run<br />controller enforces the typed values. A trace also takes no traffic.stop<br />request or session count. The operator runs the AISimulate version from its<br />configured planner image; Requests and Runs cannot select a different image<br />or version. |  | Type: object <br />Optional: \{\} <br /> |
+| `inputOverrides` _[RawExtension](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#rawextension-runtime-pkg)_ | InputOverrides is an RFC 7386 JSON Merge Patch over the input lowered from<br />the typed fields. It uses the upstream AISimulate JSON contract, including<br />snake_case names. Values here take precedence, and null deletes a lowered<br />field. The dgdr_run member must remain an object, and its operator-owned<br />transport, identity, and runtime fields name, max_candidates, snapshot_dir,<br />runtime_image, runtime_version_override, derive_runtime_images,<br />num_gpus_per_node, and namespace are operator-owned. Request admission<br />rejects them, and the Run controller enforces its values while lowering the<br />immutable snapshot. When spec.workload.trace is set, traffic and<br />traffic.source must remain objects, and the trace owns traffic.source.type,<br />format, and paths the same way: Request admission rejects them, and the Run<br />controller enforces the typed values. Other traffic overrides are AISimulate<br />input, which AISimulate validates when the Run's Job starts. The operator runs<br />the AISimulate version from its configured planner image; Requests and Runs<br />cannot select a different image or version. |  | Type: object <br />Optional: \{\} <br /> |
 
 
 #### Backend
@@ -3922,7 +3922,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `claimName` _string_ | ClaimName is the PersistentVolumeClaim, in the Request namespace, that holds the trace.<br />The Run Job mounts it read-only, and only into the AISimulate container. |  | MaxLength: 253 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` <br /> |
+| `claimName` _string_ | ClaimName is the PersistentVolumeClaim, in the Request namespace, that holds the trace.<br />The Run Job mounts only the trace file from it, read-only, and only into the AISimulate<br />container. |  | MaxLength: 253 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` <br /> |
 | `path` _string_ | Path names one trace file relative to the root of the claim. It is neither a directory<br />nor a glob. It must not start or end with '/' and must not contain empty, '.' or '..'<br />segments or a NUL character, which no file name can hold. The file must be complete before<br />the Request is created and must never be rewritten: every Run of the Request reads it when<br />its Job starts. |  | MaxLength: 1024 <br />MinLength: 1 <br /> |
 
 
@@ -3995,7 +3995,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `static` _[StaticWorkloadSpec](#staticworkloadspec)_ | Static defines AISimulate synthetic traffic. When omitted without a trace, admission<br />supplies the complete static default. An explicit empty object opts out; any nonempty<br />object is completed with omitted inputTokens, outputTokens and load defaults. |  | Optional: \{\} <br /> |
-| `trace` _[TraceWorkloadSpec](#traceworkloadspec)_ | Trace replays a recorded request trace from a PersistentVolumeClaim in the Request<br />namespace. Admission supplies no static default when it is set. The Run Job mounts the<br />claim read-only at /var/run/aisimulate/trace, and spec.aisimulate.inputOverrides cannot<br />change traffic.source.type, format or paths. |  | Optional: \{\} <br /> |
+| `trace` _[TraceWorkloadSpec](#traceworkloadspec)_ | Trace replays a recorded request trace from a PersistentVolumeClaim in the Request<br />namespace. Admission supplies no static default when it is set. The Run Job mounts only the<br />trace file, read-only through a subPath of the claim, at /var/run/aisimulate/trace/trace.jsonl,<br />or trace.jsonl.gz when the path ends in .gz, and spec.aisimulate.inputOverrides cannot change<br />traffic.source.type, format or paths. |  | Optional: \{\} <br /> |
 
 
 

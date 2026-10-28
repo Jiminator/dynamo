@@ -1232,8 +1232,8 @@ func TestV1beta2RunControllerKeepsFollowingAStartedJobAfterItsTraceClaimDisappea
 }
 
 // createDGDRRunJobPodForTest stores the pod the Job controller would create for job, bound to node
-// unless node is empty, with status, and returns it.
-func createDGDRRunJobPodForTest(t *testing.T, c client.Client, job *batchv1.Job, node string, status corev1.PodStatus) *corev1.Pod {
+// unless node is empty, with status.
+func createDGDRRunJobPodForTest(t *testing.T, c client.Client, job *batchv1.Job, node string, status corev1.PodStatus) {
 	t.Helper()
 	pod := &corev1.Pod{
 		Name: job.Name + "-pod", Namespace: job.Namespace,
@@ -1248,34 +1248,30 @@ func createDGDRRunJobPodForTest(t *testing.T, c client.Client, job *batchv1.Job,
 	if err := c.Status().Update(t.Context(), pod); err != nil {
 		t.Fatalf("update Job pod status: %v", err)
 	}
-	return pod
 }
 
 // assertDGDRRunFailedForTrace checks that the Run failed for its trace with a message that starts
-// with reason and names the deleted Job, and that neither the Job nor its pods remain.
+// with reason and names the Job, and that the completed Run deleted that Job.
 func assertDGDRRunFailedForTrace(t *testing.T, c client.Client, run *nvidiacomv1beta2.DynamoGraphDeploymentRun, jobName, reason string) {
 	t.Helper()
 	jobs := &batchv1.JobList{}
-	pods := &corev1.PodList{}
-	for _, list := range []client.ObjectList{jobs, pods} {
-		if err := c.List(t.Context(), list, client.InNamespace("default")); err != nil {
-			t.Fatalf("list %T: %v", list, err)
-		}
+	if err := c.List(t.Context(), jobs, client.InNamespace("default")); err != nil {
+		t.Fatalf("list Jobs: %v", err)
 	}
-	if len(jobs.Items) != 0 || len(pods.Items) != 0 {
-		t.Fatalf("Jobs = %d, pods = %d, want the unstarted Job and its pod deleted", len(jobs.Items), len(pods.Items))
+	if len(jobs.Items) != 0 {
+		t.Fatalf("Jobs = %d, want the Job that could never read the trace deleted", len(jobs.Items))
 	}
 	condition := meta.FindStatusCondition(run.Status.Conditions, nvidiacomv1beta2.DGDRRunConditionCompleted)
 	if run.Status.Phase != nvidiacomv1beta2.DGDRRunPhaseFailed || condition == nil ||
 		condition.Status != metav1.ConditionTrue || condition.Reason != dgdrRunReasonTraceSourceUnavailable {
 		t.Fatalf("status = %+v, want Failed and Completed=True/%s", run.Status, dgdrRunReasonTraceSourceUnavailable)
 	}
-	wantSuffix := fmt.Sprintf(`; deleted Job %q before its pod started`, jobName)
+	wantSuffix := fmt.Sprintf(`; Job %q is deleted`, jobName)
 	if !strings.HasPrefix(condition.Message, reason) || !strings.HasSuffix(condition.Message, wantSuffix) {
 		t.Fatalf("condition message = %q, want prefix %q and suffix %q", condition.Message, reason, wantSuffix)
 	}
 	if run.Status.CompletionTime == nil || run.Status.JobRef == nil || run.Status.JobRef.Name != jobName {
-		t.Fatalf("completionTime = %v, jobRef = %+v; want a completion time and the deleted Job's jobRef",
+		t.Fatalf("completionTime = %v, jobRef = %+v; want a completion time and the Job's jobRef",
 			run.Status.CompletionTime, run.Status.JobRef)
 	}
 }
@@ -1354,7 +1350,7 @@ func TestV1beta2RunControllerDeletesAnUnscheduledJobWhoseTraceClaimBecomesUnusab
 				}
 			}
 
-			t.Log("Reconcile twice: the first pass deletes the pod and the Job and fails the Run, the second sees it completed")
+			t.Log("Reconcile twice: the first pass fails the Run, the second deletes the Job of the completed Run")
 			f.reconcile()
 			f.reconcile()
 			assertDGDRRunFailedForTrace(t, f.client, f.run(), job.Name, tt.reason)
@@ -1423,7 +1419,7 @@ func TestV1beta2RunControllerDeletesAJobWhoseSweeperCannotMountTheTraceFile(t *t
 				}},
 			})
 
-			t.Log("Reconcile twice and expect only a trace mount failure to end the Run")
+			t.Log("Reconcile twice and expect only a trace mount failure to fail the Run and delete its Job")
 			f.reconcile()
 			f.reconcile()
 			if !tt.wantFailed {
@@ -1438,77 +1434,159 @@ func TestV1beta2RunControllerDeletesAJobWhoseSweeperCannotMountTheTraceFile(t *t
 	}
 }
 
-func TestV1beta2RunControllerKeepsAJobThatChangedAfterTheCacheSawIt(t *testing.T) {
+func TestV1beta2RunControllerFailsAScheduledJobOnlyForAClaimItCanNeverMount(t *testing.T) {
+	tests := []struct {
+		name           string
+		finalizers     []string
+		deleteClaim    bool
+		lose           bool
+		sweeperStarted bool
+		reason         string
+	}{
+		{
+			name:        "claim being deleted while pvc-protection keeps it for the pod",
+			finalizers:  []string{"kubernetes.io/pvc-protection"},
+			deleteClaim: true,
+		},
+		{
+			name:        "claim gone while the pod was bound",
+			deleteClaim: true,
+			reason:      `trace PersistentVolumeClaim "request-traces" does not exist in namespace "default"`,
+		},
+		{
+			name:        "claim being deleted without pvc-protection",
+			finalizers:  []string{"example.com/hold"},
+			deleteClaim: true,
+			reason:      `trace PersistentVolumeClaim "request-traces" in namespace "default" is being deleted`,
+		},
+		{
+			name:   "claim lost its volume",
+			lose:   true,
+			reason: `trace PersistentVolumeClaim "request-traces" in namespace "default" has lost its PersistentVolume`,
+		},
+		{
+			name:           "sweeper started before the claim went",
+			deleteClaim:    true,
+			sweeperStarted: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claim := traceClaimForTest()
+			claim.Finalizers = tt.finalizers
+			f := newDGDRRunFixture(t, &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}, dgdrRunWithTraceForTest(t, map[string]any{}), claim)
+			f.reconcile()
+			job := f.job()
+
+			t.Log("The Job's pod is bound to a node; its sweeper is created or still waits")
+			job.Status = batchv1.JobStatus{Active: 1, Ready: new(int32(0)), StartTime: new(metav1.Now())}
+			if err := f.client.Status().Update(t.Context(), job); err != nil {
+				t.Fatalf("update Job status: %v", err)
+			}
+			sweeper := corev1.ContainerStatus{Name: dgdrRunSweeperContainer, State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"},
+			}}
+			if tt.sweeperStarted {
+				sweeper.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
+			}
+			createDGDRRunJobPodForTest(t, f.client, job, "node-a", corev1.PodStatus{
+				Phase: corev1.PodPending, ContainerStatuses: []corev1.ContainerStatus{sweeper},
+			})
+
+			t.Log("The claim changes after the binding")
+			if tt.deleteClaim {
+				if err := f.client.Delete(t.Context(), traceClaimForTest()); err != nil {
+					t.Fatalf("delete claim: %v", err)
+				}
+			}
+			if tt.lose {
+				stored := &corev1.PersistentVolumeClaim{}
+				if err := f.client.Get(t.Context(), client.ObjectKeyFromObject(claim), stored); err != nil {
+					t.Fatalf("get claim: %v", err)
+				}
+				stored.Status.Phase = corev1.ClaimLost
+				if err := f.client.Status().Update(t.Context(), stored); err != nil {
+					t.Fatalf("lose claim: %v", err)
+				}
+			}
+
+			t.Log("Reconcile twice and expect only a claim the pod can never mount to end the Run")
+			f.reconcile()
+			f.reconcile()
+			if tt.reason == "" {
+				if kept := f.job(); kept.UID != job.UID {
+					t.Fatalf("Job UID = %q, want the Job %q kept", kept.UID, job.UID)
+				}
+				assertDGDRRunRunningStatus(t, f.run(), job.Name)
+				return
+			}
+			assertDGDRRunFailedForTrace(t, f.client, f.run(), job.Name, tt.reason)
+		})
+	}
+}
+
+func TestV1beta2RunControllerDoesNotLetAStaleRunUndoATraceFailure(t *testing.T) {
 	tests := []struct {
 		name string
-		// cachedPods tells the cached pod List to return the stale pod; otherwise it returns none.
-		cachedPods bool
+		// jobCondition, when set, finishes the Job after the trace failure was recorded.
+		jobCondition batchv1.JobConditionType
 	}{
-		{name: "pod scheduled after the cache saw it unscheduled", cachedPods: true},
-		{name: "pod created after the cache saw the Job without it"},
+		{name: "the trace is still unreadable"},
+		{name: "the Job completes after the failure", jobCondition: batchv1.JobComplete},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newDGDRRunFixture(t, &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}, dgdrRunWithTraceForTest(t, map[string]any{}), traceClaimForTest())
 			f.reconcile()
-			staleJob := f.job()
+			job := f.job()
 
-			t.Log("The cache saw the Job before its pod, or the pod before it was scheduled")
-			job := staleJob.DeepCopy()
+			t.Log("The Job's pod waits unscheduled while the Run is Running")
 			job.Status = batchv1.JobStatus{Active: 1, Ready: new(int32(0)), StartTime: new(metav1.Now())}
 			if err := f.client.Status().Update(t.Context(), job); err != nil {
 				t.Fatalf("update Job status: %v", err)
 			}
-			pod := createDGDRRunJobPodForTest(t, f.client, job, "", corev1.PodStatus{Phase: corev1.PodPending})
-			stalePod := pod.DeepCopy()
-			cachedJob := job.DeepCopy()
-			if !tt.cachedPods {
-				cachedJob = staleJob
-			}
+			createDGDRRunJobPodForTest(t, f.client, job, "", corev1.PodStatus{Phase: corev1.PodPending})
+			f.reconcile()
+			stale := f.run()
+			assertDGDRRunRunningStatus(t, stale, job.Name)
 
-			t.Log("The pod is scheduled; the cache does not show it yet")
-			pod.Spec.NodeName = "node-a"
-			if err := f.client.Update(t.Context(), pod); err != nil {
-				t.Fatalf("schedule pod: %v", err)
-			}
-			cached := f.reconciler.Client
-			f.reconciler.Client = interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
-				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-					switch list := list.(type) {
-					case *batchv1.JobList:
-						list.Items = []batchv1.Job{*cachedJob.DeepCopy()}
-						return nil
-					case *corev1.PodList:
-						list.Items = nil
-						if tt.cachedPods {
-							list.Items = []corev1.Pod{*stalePod.DeepCopy()}
-						}
-						return nil
-					}
-					return c.List(ctx, list, opts...)
-				},
-			})
-
-			t.Log("The claim disappears; the stale delete conflicts instead of removing the scheduled pod")
+			t.Log("The claim goes and the trace failure is recorded")
 			if err := f.client.Delete(t.Context(), traceClaimForTest()); err != nil {
 				t.Fatalf("delete claim: %v", err)
 			}
-			_, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.run())})
-			if !apierrors.IsConflict(err) {
-				t.Fatalf("reconcile error = %v, want a delete conflict", err)
+			f.reconcile()
+			failed := f.run()
+			if condition := meta.FindStatusCondition(failed.Status.Conditions, nvidiacomv1beta2.DGDRRunConditionCompleted); condition == nil ||
+				condition.Reason != dgdrRunReasonTraceSourceUnavailable {
+				t.Fatalf("Completed condition = %+v, want %s", condition, dgdrRunReasonTraceSourceUnavailable)
 			}
-			stored := &corev1.Pod{}
-			if err := f.client.Get(t.Context(), client.ObjectKeyFromObject(pod), stored); err != nil {
-				t.Fatalf("get pod: %v", err)
-			}
-			if kept := f.job(); kept.UID != job.UID {
-				t.Fatalf("Job UID = %q, want the Job %q kept", kept.UID, job.UID)
+			if tt.jobCondition != "" {
+				stored := f.job()
+				stored.Status.Conditions = []batchv1.JobCondition{{Type: tt.jobCondition, Status: corev1.ConditionTrue}}
+				if err := f.client.Status().Update(t.Context(), stored); err != nil {
+					t.Fatalf("finish Job: %v", err)
+				}
 			}
 
-			t.Log("Once the cache shows the scheduled pod, the Job drives the Run")
+			t.Log("A pass that still reads the Running Run conflicts instead of overwriting the failure")
+			cached := f.reconciler.Client
+			f.reconciler.Client = interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if run, ok := obj.(*nvidiacomv1beta2.DynamoGraphDeploymentRun); ok {
+						stale.DeepCopyInto(run)
+						return nil
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			})
+			_, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(stale)})
+			if !apierrors.IsConflict(err) {
+				t.Fatalf("reconcile error = %v, want a status conflict", err)
+			}
 			f.reconciler.Client = cached
-			f.reconcile()
-			assertDGDRRunRunningStatus(t, f.run(), job.Name)
+			if got := f.run(); !reflect.DeepEqual(got.Status, failed.Status) {
+				t.Fatalf("status = %+v, want the recorded failure %+v", got.Status, failed.Status)
+			}
 		})
 	}
 }
@@ -1535,14 +1613,14 @@ func TestV1beta2RunControllerWaitsUntilTheCacheShowsAnActiveJobsPod(t *testing.T
 	assertDGDRRunRunningStatus(t, f.run(), job.Name)
 }
 
-func TestV1beta2RunControllerFailsTheRunAfterDeletingItsJobDespiteAFailedStatusPatch(t *testing.T) {
+func TestV1beta2RunControllerKeepsTheJobUntilTheTraceFailureIsRecorded(t *testing.T) {
 	f := newDGDRRunFixture(t, &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}, dgdrRunWithTraceForTest(t, map[string]any{}), traceClaimForTest())
 	f.reconcile()
 	f.reconcile()
 	jobName := f.job().Name
 	assertDGDRRunPendingStatus(t, f.run(), jobName)
 
-	t.Log("Delete the claim, then fail the status patch that follows the Job deletion")
+	t.Log("Delete the claim, then fail the status patch that records the trace failure")
 	if err := f.client.Delete(t.Context(), traceClaimForTest()); err != nil {
 		t.Fatalf("delete claim: %v", err)
 	}
@@ -1555,28 +1633,19 @@ func TestV1beta2RunControllerFailsTheRunAfterDeletingItsJobDespiteAFailedStatusP
 	if _, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.run())}); err == nil {
 		t.Fatal("reconcile error = nil, want the injected status patch failure")
 	}
-	jobs := &batchv1.JobList{}
-	if err := f.client.List(t.Context(), jobs, client.InNamespace("default")); err != nil {
-		t.Fatalf("list Jobs: %v", err)
-	}
-	if len(jobs.Items) != 0 {
-		t.Fatalf("Jobs = %d, want the unstarted Job deleted", len(jobs.Items))
-	}
 
-	t.Log("The next pass checks the claim again despite the recorded jobRef and fails the Run instead of creating another Job")
+	t.Log("The Job stays until the failure is recorded, so no pass can create another one")
+	if job := f.job(); job.Name != jobName {
+		t.Fatalf("Job = %q, want %q kept", job.Name, jobName)
+	}
+	assertDGDRRunPendingStatus(t, f.run(), jobName)
+
+	t.Log("The next passes record the failure and then delete the Job")
 	f.reconciler.Client = cached
 	f.reconcile()
-	if err := f.client.List(t.Context(), jobs, client.InNamespace("default")); err != nil {
-		t.Fatalf("list Jobs: %v", err)
-	}
-	if len(jobs.Items) != 0 {
-		t.Fatalf("Jobs = %d, want no new Job for a claim that is gone", len(jobs.Items))
-	}
-	run := f.run()
-	condition := meta.FindStatusCondition(run.Status.Conditions, nvidiacomv1beta2.DGDRRunConditionCompleted)
-	if run.Status.Phase != nvidiacomv1beta2.DGDRRunPhaseFailed || condition == nil || condition.Reason != dgdrRunReasonTraceSourceUnavailable {
-		t.Fatalf("status = %+v, want Failed and Completed=True/%s", run.Status, dgdrRunReasonTraceSourceUnavailable)
-	}
+	f.reconcile()
+	assertDGDRRunFailedForTrace(t, f.client, f.run(), jobName,
+		`trace PersistentVolumeClaim "request-traces" does not exist in namespace "default"`)
 }
 
 func TestV1beta2RunControllerWakesTheRunsThatReadAChangedTraceClaim(t *testing.T) {
