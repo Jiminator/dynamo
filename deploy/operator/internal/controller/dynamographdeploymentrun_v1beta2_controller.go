@@ -37,10 +37,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 )
@@ -75,6 +77,7 @@ const (
 	dgdrRunSnapshotPathAnnotation  = "nvidia.com/dgdr-snapshot-path"
 	dgdrRunResourceComponent       = "aisimulate"
 	dgdrRunServiceAccountTokenTTL  = int64(3600)
+	dgdrRunTraceGroup              = int64(65532)
 	dgdrRunReasonPending           = "JobPending"
 	dgdrRunReasonRunning           = "JobRunning"
 	dgdrRunReasonSucceeded         = "SearchSucceeded"
@@ -116,7 +119,7 @@ type DynamoGraphDeploymentRunV1beta2Reconciler struct {
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentcandidates,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentcandidates/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps;serviceaccounts,verbs=get;list;watch;create;update;patch
@@ -167,28 +170,22 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) Reconcile(
 		}
 	}
 
-	// Until its pod starts, the Job still has to mount the claim, and a pod that cannot stays pending
-	// with nothing to end the Job. Such a Job is deleted and the Run fails. Claim events wake the Run
-	// for this check; once the pod has started, the Job alone decides the outcome.
-	if job != nil && dgdrRunTraceClaim(run) != nil {
-		started, err := r.jobPodStarted(ctx, job)
+	// A Job whose pod can never read the trace would stay pending with nothing to end it: such a Job
+	// is deleted and the Run fails. Claim and pod events wake the Run for this check.
+	if job != nil && dgdrRunTraceClaim(run) != nil && !dgdrRunJobFinished(job) {
+		unavailable, pods, err := r.jobTraceUnavailable(ctx, run, job)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if !started {
-			unavailable, err := r.traceSourceUnavailable(ctx, run)
-			if err != nil {
+		if unavailable != "" {
+			if err := r.deleteUnstartedJob(ctx, job, pods); err != nil {
 				return ctrl.Result{}, err
 			}
-			if unavailable != "" {
-				if err := r.deleteUnstartedJob(ctx, job); err != nil {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{}, r.failUnstartedRun(ctx, run, dgdrRunReasonTraceSourceUnavailable,
-					fmt.Sprintf("%s; deleted Job %q before its pod started", unavailable, job.Name))
-			}
+			return ctrl.Result{}, r.failUnstartedRun(ctx, run, dgdrRunReasonTraceSourceUnavailable,
+				fmt.Sprintf("%s; deleted Job %q before its pod started", unavailable, job.Name))
 		}
 	}
+
 	if err := r.reconcilePublisherAccess(ctx, run, resourceName); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -332,52 +329,140 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) runsForTraceClaim(ctx contex
 	return requests
 }
 
-// jobPodStarted reports whether job no longer needs to mount its volumes: its pod has left the
-// Pending phase, or the Job reports a ready or finished pod or a terminal condition. The Job runs
-// one pod, because its backoffLimit is 0. A pod never returns to Pending, unlike status.ready,
-// which drops to 0 again when one of the pod's containers exits. job must not be nil.
-func (r *DynamoGraphDeploymentRunV1beta2Reconciler) jobPodStarted(ctx context.Context, job *batchv1.Job) (bool, error) {
-	// The Job's own status, which also covers a pod the cache no longer shows.
+// dgdrRunJobFinished reports whether job reports a finished pod or a terminal or interim terminal
+// condition, so its outcome no longer depends on the trace. The Job runs one pod, because its
+// backoffLimit is 0. job must not be nil.
+func dgdrRunJobFinished(job *batchv1.Job) bool {
 	uncounted := job.Status.UncountedTerminatedPods
-	if ptr.Deref(job.Status.Ready, 0) > 0 || job.Status.Succeeded > 0 || job.Status.Failed > 0 ||
+	if job.Status.Succeeded > 0 || job.Status.Failed > 0 ||
 		(uncounted != nil && len(uncounted.Succeeded)+len(uncounted.Failed) > 0) {
-		return true, nil
+		return true
 	}
 	for _, conditionType := range []batchv1.JobConditionType{
 		batchv1.JobComplete, batchv1.JobFailed, batchv1.JobSuccessCriteriaMet, batchv1.JobFailureTarget,
 	} {
 		if condition := dgdrRunJobCondition(job, conditionType); condition != nil && condition.Status == corev1.ConditionTrue {
-			return true, nil
+			return true
 		}
 	}
-
-	// The pod's phase, which stays past Pending once its volumes were mounted.
-	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{batchv1.JobNameLabel: job.Name}); err != nil {
-		return false, fmt.Errorf("list pods of Job %q: %w", job.Name, err)
-	}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if metav1.IsControlledBy(pod, job) && pod.Status.Phase != "" && pod.Status.Phase != corev1.PodPending {
-			return true, nil
-		}
-	}
-	return false, nil
+	return false
 }
 
-// deleteUnstartedJob deletes job, whose pod has not started, together with its pods. The
-// preconditions refuse to delete a Job that changed after the cache showed it, such as one whose pod
-// became ready since; the conflict is returned and retried against the newer Job. job must not be
-// nil.
-func (r *DynamoGraphDeploymentRunV1beta2Reconciler) deleteUnstartedJob(ctx context.Context, job *batchv1.Job) error {
-	err := r.Delete(ctx, job,
-		client.PropagationPolicy(metav1.DeletePropagationBackground),
-		client.Preconditions{UID: &job.UID, ResourceVersion: &job.ResourceVersion},
-	)
+// jobTraceUnavailable returns why job, which has not finished, can never read the Run's trace, or
+// "" when it can or still may. It also returns the Job's pods as the cache shows them, which
+// deleteUnstartedJob takes.
+//
+// A sweeper that cannot mount the trace file waits in CreateContainerConfigError until the pod is
+// deleted, so that is reported whatever the claim does. The claim itself matters only until the
+// pod is scheduled: from then on pvc-protection keeps the claim for the pod, and the kubelet mounts
+// it even while it is being deleted. Pod phase is no boundary, because a pod stays Pending after its
+// volumes are mounted while its images are pulled. While the cache shows fewer pods than the Job
+// counts as active, whether one is scheduled is unknown and nothing is reported; the pod's event
+// wakes the Run again. run and job must not be nil.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) jobTraceUnavailable(
+	ctx context.Context,
+	run *nvidiacomv1beta2.DynamoGraphDeploymentRun,
+	job *batchv1.Job,
+) (string, []corev1.Pod, error) {
+	list := &corev1.PodList{}
+	if err := r.List(ctx, list, client.InNamespace(job.Namespace), client.MatchingLabels{batchv1.JobNameLabel: job.Name}); err != nil {
+		return "", nil, fmt.Errorf("list pods of Job %q: %w", job.Name, err)
+	}
+	pods := make([]corev1.Pod, 0, len(list.Items))
+	for i := range list.Items {
+		if metav1.IsControlledBy(&list.Items[i], job) {
+			pods = append(pods, list.Items[i])
+		}
+	}
+
+	// A trace file the sweeper cannot mount, whether or not the claim is usable.
+	source := dgdrRunTraceClaim(run)
+	for i := range pods {
+		if message := dgdrRunTraceMountFailure(&pods[i]); message != "" {
+			return fmt.Sprintf("trace file %q on PersistentVolumeClaim %q cannot be mounted: %s",
+				source.Path, source.ClaimName, message), pods, nil
+		}
+	}
+
+	// The claim, while no pod is scheduled.
+	if ptr.Deref(job.Status.Ready, 0) > 0 || int(job.Status.Active) > len(pods) {
+		return "", pods, nil
+	}
+	for i := range pods {
+		if pods[i].Spec.NodeName != "" {
+			return "", pods, nil
+		}
+	}
+	unavailable, err := r.traceSourceUnavailable(ctx, run)
+	return unavailable, pods, err
+}
+
+// dgdrRunTraceMountFailure returns the kubelet's message when pod's sweeper cannot start because
+// the trace file cannot be mounted, such as a missing file on a read-only claim or a symlink that
+// leaves the claim, or "" otherwise. pod must not be nil.
+func dgdrRunTraceMountFailure(pod *corev1.Pod) string {
+	for _, status := range pod.Status.ContainerStatuses {
+		waiting := status.State.Waiting
+		if status.Name == dgdrRunSweeperContainer && waiting != nil && waiting.Reason == "CreateContainerConfigError" &&
+			strings.Contains(waiting.Message, fmt.Sprintf("volumeMount %q", dgdrRunTraceVolume)) {
+			return waiting.Message
+		}
+	}
+	return ""
+}
+
+// deleteUnstartedJob deletes job and pods, its pods as the cache showed them. Every delete carries
+// the UID and resourceVersion the cache showed, so an object that changed since, such as a pod
+// scheduled meanwhile, conflicts instead of being deleted, and the conflict is retried against the
+// newer state. Deleting a pod changes the Job's status, so the Job then keeps only its UID
+// precondition. job must not be nil.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) deleteUnstartedJob(ctx context.Context, job *batchv1.Job, pods []corev1.Pod) error {
+	for i := range pods {
+		pod := &pods[i]
+		err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID, ResourceVersion: &pod.ResourceVersion})
+		if client.IgnoreNotFound(err) != nil {
+			return fmt.Errorf("delete pod %q of Job %q: %w", pod.Name, job.Name, err)
+		}
+	}
+
+	// The Job, with its resourceVersion only while no pod was deleted.
+	preconditions := client.Preconditions{UID: &job.UID, ResourceVersion: &job.ResourceVersion}
+	if len(pods) > 0 {
+		preconditions.ResourceVersion = nil
+	}
+	err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground), preconditions)
 	if client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("delete Job %q: %w", job.Name, err)
 	}
 	return nil
+}
+
+// dgdrRunJobPod reports whether obj is a pod of a Job named like a Run's AISimulate Job.
+func dgdrRunJobPod(obj client.Object) bool {
+	owner := metav1.GetControllerOf(obj)
+	return owner != nil && owner.Kind == "Job" && owner.APIVersion == batchv1.SchemeGroupVersion.String() &&
+		strings.HasSuffix(owner.Name, "-"+dgdrRunResourceComponent)
+}
+
+// runForJobPod maps a pod event to the Run that controls the pod's Job.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) runForJobPod(ctx context.Context, pod client.Object) []reconcile.Request {
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil {
+		return nil
+	}
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: pod.GetNamespace(), Name: owner.Name}, job); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.FromContext(ctx).Error(err, "Could not get the Job of a pod", "pod", pod.GetName(), "job", owner.Name)
+		}
+		return nil
+	}
+	run := metav1.GetControllerOf(job)
+	if job.UID != owner.UID || run == nil ||
+		run.Kind != "DynamoGraphDeploymentRun" || run.APIVersion != nvidiacomv1beta2.GroupVersion.String() {
+		return nil
+	}
+	return []reconcile.Request{{Namespace: job.Namespace, Name: run.Name}}
 }
 
 // failUnstartedRun completes a Run whose Job never started a pod: none was created, or the controller
@@ -868,7 +953,6 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) buildJob(
 					ServiceAccountName:           name,
 					AutomountServiceAccountToken: new(false),
 					RestartPolicy:                corev1.RestartPolicyNever,
-					SecurityContext:              &corev1.PodSecurityContext{FSGroup: ptr.To[int64](65532)},
 					ImagePullSecrets:             append([]corev1.LocalObjectReference(nil), execution.ImagePullSecrets...),
 					Containers: []corev1.Container{
 						{
@@ -924,10 +1008,13 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) buildJob(
 		},
 	}
 
-	// Only AISimulate reads the trace. The whole claim is mounted read-only without a subPath,
-	// which the kubelet would have to create, at the directory aisimulate.TracePath resolves under.
+	// Only AISimulate reads the trace. The Job mounts the one trace file read-only through a subPath,
+	// which the kubelet resolves inside the claim, refusing a symlink that leaves it. The pod sets no
+	// fsGroup, for which kubelet and CSI drivers may chown and chmod a volume recursively; the trace
+	// group is a supplemental group instead, which changes no volume.
 	if source := dgdrRunTraceClaim(run); source != nil {
 		pod := &job.Spec.Template.Spec
+		pod.SecurityContext = &corev1.PodSecurityContext{SupplementalGroups: []int64{dgdrRunTraceGroup}}
 		pod.Volumes = append(pod.Volumes, corev1.Volume{
 			Name: dgdrRunTraceVolume,
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
@@ -938,7 +1025,7 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) buildJob(
 		for i := range pod.Containers {
 			if pod.Containers[i].Name == dgdrRunSweeperContainer {
 				pod.Containers[i].VolumeMounts = append(pod.Containers[i].VolumeMounts, corev1.VolumeMount{
-					Name: dgdrRunTraceVolume, MountPath: aisimulate.TraceMountPath, ReadOnly: true,
+					Name: dgdrRunTraceVolume, MountPath: aisimulate.TracePath(source.Path), SubPath: source.Path, ReadOnly: true,
 				})
 			}
 		}
@@ -1127,6 +1214,8 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) SetupWithManager(mgr ctrl.Ma
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
 		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.runsForTraceClaim)).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.runForJobPod),
+			builder.WithPredicates(predicate.NewPredicateFuncs(dgdrRunJobPod))).
 		WithEventFilter(commoncontroller.EphemeralDeploymentEventFilter(r.Config, r.RuntimeConfig)).
 		Complete(r)
 }

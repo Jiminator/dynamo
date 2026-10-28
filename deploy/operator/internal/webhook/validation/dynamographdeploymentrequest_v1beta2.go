@@ -58,7 +58,7 @@ func validateDynamoGraphDeploymentRequestSpecV1beta2(
 ) field.ErrorList {
 	allErrs := field.ErrorList{}
 	if spec.Workload != nil {
-		allErrs = append(allErrs, aisimulate.ValidateTraceWorkload(spec.Workload, fldPath.Child("workload"))...)
+		allErrs = append(allErrs, validateWorkloadSpec(spec.Workload, fldPath.Child("workload"))...)
 	}
 	if spec.AISimulate != nil {
 		allErrs = append(allErrs, validateAISimulateSpec(spec.AISimulate, spec.Workload, fldPath.Child("aisimulate"))...)

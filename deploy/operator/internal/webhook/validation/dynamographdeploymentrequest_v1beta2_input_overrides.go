@@ -77,11 +77,10 @@ func validateAISimulateSpec(
 	return allErrs
 }
 
-// validateTraceOverrides rejects the traffic overrides a trace workload cannot take. The trace owns
-// traffic.source.type, format and paths, and a traffic or traffic.source value that is not an
-// object would delete them. A trace replays every recorded request, so AISimulate accepts no
-// request or session count in traffic.stop, and a traffic.stop that is neither null nor an object
-// is no stop at all. Other load and stop overrides stay allowed.
+// validateTraceOverrides rejects the traffic overrides that would replace what a trace workload
+// owns: traffic.source.type, format and paths, or a traffic or traffic.source value that is not an
+// object and would delete them. Every other traffic override is AISimulate input, which AISimulate
+// validates itself.
 func validateTraceOverrides(overrides map[string]any, fldPath *field.Path) field.ErrorList {
 	const owned = "is owned by spec.workload.trace and cannot be overridden"
 	traffic, found := overrides["traffic"]
@@ -95,33 +94,18 @@ func validateTraceOverrides(overrides map[string]any, fldPath *field.Path) field
 	}
 
 	// The source fields the trace owns, or a source that is not an object.
-	allErrs := field.ErrorList{}
-	if source, found := trafficObject["source"]; found {
-		sourceObject, ok := source.(map[string]any)
-		if !ok {
-			return field.ErrorList{field.Forbidden(fldPath.Child("traffic", "source"), owned)}
-		}
-		for _, key := range []string{"format", "paths", "type"} {
-			if _, found := sourceObject[key]; found {
-				allErrs = append(allErrs, field.Forbidden(fldPath.Child("traffic", "source", key), owned))
-			}
-		}
+	source, found := trafficObject["source"]
+	if !found {
+		return nil
 	}
-
-	// The stop must be null or an object without the count stops AISimulate rejects for trace traffic;
-	// a null stop or count only deletes an absent value.
-	stop, found := trafficObject["stop"]
-	if !found || stop == nil {
-		return allErrs
-	}
-	stopObject, ok := stop.(map[string]any)
+	sourceObject, ok := source.(map[string]any)
 	if !ok {
-		return append(allErrs, field.Forbidden(fldPath.Child("traffic", "stop"), "must be an object or null"))
+		return field.ErrorList{field.Forbidden(fldPath.Child("traffic", "source"), owned)}
 	}
-	for _, key := range []string{"requests", "requests_per_load_unit", "sessions", "sessions_per_load_unit"} {
-		if value, found := stopObject[key]; found && value != nil {
-			allErrs = append(allErrs, field.Forbidden(fldPath.Child("traffic", "stop", key),
-				"a trace replays every recorded request; only max_virtual_time_seconds can stop it"))
+	allErrs := field.ErrorList{}
+	for _, key := range []string{"format", "paths", "type"} {
+		if _, found := sourceObject[key]; found {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Child("traffic", "source", key), owned))
 		}
 	}
 	return allErrs

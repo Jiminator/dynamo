@@ -18,11 +18,9 @@
 package aisimulate
 
 import (
-	"strings"
 	"testing"
 
 	v1beta2 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta2"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 func withTrace(spec *v1beta2.DynamoGraphDeploymentRequestSpec, speedup *float64) *v1beta2.DynamoGraphDeploymentRequestSpec {
@@ -46,19 +44,19 @@ func TestLowerTraceWorkload(t *testing.T) {
 			name: "recorded arrival times without a request stop",
 			spec: withTrace(defaultedSpec(), nil),
 			wantTraffic: `{"load":{"type":"trace_timestamps"},` +
-				`"source":{"format":"dynamo","paths":["/var/run/aisimulate/trace/retune/w-1.jsonl.gz"],"type":"trace"}}`,
+				`"source":{"format":"dynamo","paths":["/var/run/aisimulate/trace/trace.jsonl.gz"],"type":"trace"}}`,
 		},
 		{
 			name: "an arrival speedup lowers to traffic.load.speedup",
 			spec: withTrace(defaultedSpec(), new(2.5)),
 			wantTraffic: `{"load":{"speedup":2.5,"type":"trace_timestamps"},` +
-				`"source":{"format":"dynamo","paths":["/var/run/aisimulate/trace/retune/w-1.jsonl.gz"],"type":"trace"}}`,
+				`"source":{"format":"dynamo","paths":["/var/run/aisimulate/trace/trace.jsonl.gz"],"type":"trace"}}`,
 		},
 		{
 			name: "a stop override still applies",
 			spec: withInputOverrides(withTrace(defaultedSpec(), nil), `{"traffic":{"stop":{"max_virtual_time_seconds":600}}}`),
 			wantTraffic: `{"load":{"type":"trace_timestamps"},` +
-				`"source":{"format":"dynamo","paths":["/var/run/aisimulate/trace/retune/w-1.jsonl.gz"],"type":"trace"},` +
+				`"source":{"format":"dynamo","paths":["/var/run/aisimulate/trace/trace.jsonl.gz"],"type":"trace"},` +
 				`"stop":{"max_virtual_time_seconds":600}}`,
 		},
 	}
@@ -72,75 +70,14 @@ func TestLowerTraceWorkload(t *testing.T) {
 	}
 }
 
-func TestTracePathStaysUnderTheMount(t *testing.T) {
+func TestTracePathIsOneFixedFileUnderTheMount(t *testing.T) {
 	for claimPath, want := range map[string]string{
-		"retune/w-1.jsonl":    "/var/run/aisimulate/trace/retune/w-1.jsonl",
-		"../../etc/passwd":    "/var/run/aisimulate/trace/etc/passwd",
-		"/abs/./trace.jsonl/": "/var/run/aisimulate/trace/abs/trace.jsonl",
+		"retune/w-1.jsonl.gz": "/var/run/aisimulate/trace/trace.jsonl.gz",
+		"retune/w-1.jsonl":    "/var/run/aisimulate/trace/trace.jsonl",
+		"../../etc/passwd":    "/var/run/aisimulate/trace/trace.jsonl",
 	} {
 		if got := TracePath(claimPath); got != want {
 			t.Errorf("TracePath(%q) = %q, want %q", claimPath, got, want)
 		}
-	}
-}
-
-func TestValidateTraceWorkload(t *testing.T) {
-	type traceCase struct {
-		name   string
-		mutate func(*v1beta2.WorkloadSpec)
-		want   []string
-	}
-	tests := []traceCase{
-		{name: "a valid trace", mutate: func(*v1beta2.WorkloadSpec) {}},
-		{name: "a hidden file and dotted names are ordinary segments", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Trace.Source.PVC.Path = ".cache/a..b/.trace.jsonl"
-		}},
-		{name: "a workload without a trace", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Trace = nil
-			w.Static = &v1beta2.StaticWorkloadSpec{}
-		}},
-		{name: "static beside a trace", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Static = &v1beta2.StaticWorkloadSpec{}
-		}, want: []string{"spec.workload.static: Forbidden: static and trace are mutually exclusive"}},
-		{name: "a missing format", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Trace.Format = ""
-		}, want: []string{"spec.workload.trace.format: Required value"}},
-		{name: "an unsupported format", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Trace.Format = "mooncake"
-		}, want: []string{`spec.workload.trace.format: Unsupported value: "mooncake": supported values: "dynamo"`}},
-		{name: "a missing pvc", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Trace.Source.PVC = nil
-		}, want: []string{"spec.workload.trace.source.pvc: Required value: pvc is required"}},
-		{name: "a claim name that is not a DNS subdomain", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Trace.Source.PVC.ClaimName = "Traces_1"
-		}, want: []string{`spec.workload.trace.source.pvc.claimName: Invalid value: "Traces_1": a lowercase RFC 1123 subdomain`}},
-		{name: "a path with a NUL character", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Trace.Source.PVC.Path = "retune/w\x00.jsonl"
-		}, want: []string{`spec.workload.trace.source.pvc.path: Invalid value: "retune/w\x00.jsonl": path must not contain a NUL character`}},
-		{name: "a non-positive speedup", mutate: func(w *v1beta2.WorkloadSpec) {
-			w.Trace.Replay.ArrivalSpeedupRatio = new(0.0)
-		}, want: []string{"spec.workload.trace.replay.arrivalSpeedupRatio: Invalid value: 0: must be greater than 0"}},
-	}
-	for _, claimPath := range []string{"", "/abs/trace.jsonl", "dir/", "a//b", ".", "..", "./a", "a/./b", "a/../b", "../a", "a/..", strings.Repeat("a", 1025)} {
-		tests = append(tests, traceCase{
-			name:   "path " + claimPath[:min(len(claimPath), 16)],
-			mutate: func(w *v1beta2.WorkloadSpec) { w.Trace.Source.PVC.Path = claimPath },
-			want:   []string{"spec.workload.trace.source.pvc.path: Invalid value: "},
-		})
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			workload := withTrace(defaultedSpec(), new(1.0)).Workload
-			tt.mutate(workload)
-			errs := ValidateTraceWorkload(workload, field.NewPath("spec", "workload"))
-			if len(errs) != len(tt.want) {
-				t.Fatalf("errors = %v, want %d matching %v", errs, len(tt.want), tt.want)
-			}
-			for i, want := range tt.want {
-				if !strings.HasPrefix(errs[i].Error(), want) {
-					t.Errorf("error[%d] = %q, want prefix %q", i, errs[i].Error(), want)
-				}
-			}
-		})
 	}
 }

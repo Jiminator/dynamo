@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"sort"
-	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,51 +46,6 @@ func TestDynamoGraphDeploymentRequestCarrierObjectsStayWritable(t *testing.T) {
 			t.Fatal("the carrier gained a static workload beside the trace")
 		}
 	})
-}
-
-// A v1beta1 carrier has no trace schema, so a carrier seeded without admission can hold a trace
-// path the v1beta2 CEL rules reject. CEL ratcheting then admits every write that leaves that path
-// unchanged, which leaves the v1beta2 validating webhook as the only check on the next write.
-func TestDynamoGraphDeploymentRequestCarrierTraceIsValidatedOnTheNextWrite(t *testing.T) {
-	env := admissionEnv.ForTest(t)
-	admissionGate.set(features.Gates{GPUDiscovery: true})
-	setAdmissionH100Topology()
-	warnings := &warningRecorder{}
-	seeder := newAdmissionResourceClient(t, env, betaDGDRForAdmission(nil), legacySeedUsername, warnings)
-	unadmittedBeta2 := newAdmissionResourceClient(t, env, beta2DGDRForAdmission(nil), legacySeedUsername, warnings)
-	beta2 := newAdmissionResourceClient(t, env, beta2DGDRForAdmission(nil), "", warnings)
-
-	t.Log("Seed a v1beta1 carrier whose trace path leaves the claim, without admission")
-	carrier := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "nvidia.com/v1beta1",
-		"kind":       "DynamoGraphDeploymentRequest",
-		"metadata":   map[string]any{"name": "seeded-trace", "namespace": env.Namespace()},
-		"spec": map[string]any{"v1beta2": map[string]any{
-			"model":    map[string]any{"name": "Qwen/Qwen3-0.6B"},
-			"hardware": map[string]any{"gpu": map[string]any{"sku": "h100_sxm", "budget": int64(4)}},
-			"workload": map[string]any{"trace": map[string]any{
-				"format": "dynamo",
-				"source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "../escape.jsonl"}},
-			}},
-		}},
-	}}
-	if _, err := seeder.Create(t.Context(), carrier, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("seed the carrier without admission: %v", err)
-	}
-
-	t.Log("The schema alone admits a v1beta2 write that keeps the invalid path")
-	if _, err := unadmittedBeta2.Patch(t.Context(), "seeded-trace", types.MergePatchType,
-		[]byte(`{"metadata":{"labels":{"trace-probe-unadmitted":"1"}}}`), metav1.PatchOptions{}); err != nil {
-		t.Fatalf("metadata patch without admission: %v", err)
-	}
-
-	t.Log("The validating webhook rejects the same write")
-	_, err := beta2.Patch(t.Context(), "seeded-trace", types.MergePatchType,
-		[]byte(`{"metadata":{"labels":{"trace-probe-admitted":"1"}}}`), metav1.PatchOptions{})
-	const want = `spec.workload.trace.source.pvc.path: Invalid value: "../escape.jsonl": path must be relative to the claim root`
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Fatalf("metadata patch through admission: error = %v, want %q", err, want)
-	}
 }
 
 func setBeta2AdmissionTrace(request *nvidiacomv1beta2.DynamoGraphDeploymentRequest) {

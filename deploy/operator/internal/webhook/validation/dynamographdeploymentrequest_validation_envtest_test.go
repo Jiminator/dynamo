@@ -833,23 +833,206 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 				"spec.aisimulate.inputOverrides.traffic.source.type: Forbidden: is owned by spec.workload.trace and cannot be overridden",
 			},
 		},
+		// A v1beta2 trace in a v1beta1 carrier stored without admission: CEL ratchets the unchanged
+		// trace on the next v1beta2 write, so the structural webhook recursion rejects it.
 		{
-			name: "v1beta2 a trace keeps load and virtual-time stop overrides",
+			name:       "v1beta2 carrier trace path that leaves the claim",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": v1beta2TraceForAdmission("../escape.jsonl")}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("../escape.jsonl")}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload.trace.source.pvc.path: Invalid value: "../escape.jsonl": path must be relative to the claim root without empty, '.' or '..' segments`,
+			},
+			// CEL ratchets the unchanged trace and reports what it tolerated as a warning.
+			wantWarnings: []string{
+				`spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier absolute trace path",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": v1beta2TraceForAdmission("/w.jsonl")}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("/w.jsonl")}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload.trace.source.pvc.path: Invalid value: "/w.jsonl": path must be relative to the claim root without empty, '.' or '..' segments`,
+			},
+			// CEL ratchets the unchanged trace and reports what it tolerated as a warning.
+			wantWarnings: []string{
+				`spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace path with an empty segment",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": v1beta2TraceForAdmission("retune//w.jsonl")}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("retune//w.jsonl")}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload.trace.source.pvc.path: Invalid value: "retune//w.jsonl": path must be relative to the claim root without empty, '.' or '..' segments`,
+			},
+			// CEL ratchets the unchanged trace and reports what it tolerated as a warning.
+			wantWarnings: []string{
+				`spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace path with a NUL character",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": v1beta2TraceForAdmission("retune/w\x00.jsonl")}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("retune/w\x00.jsonl")}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				"spec.workload.trace.source.pvc.path: Invalid value: \"retune/w\\x00.jsonl\": path must not contain a NUL character",
+			},
+			// CEL ratchets the unchanged trace and reports what it tolerated as a warning.
+			wantWarnings: []string{
+				`spec.workload.trace.source.pvc.path: Invalid value: "string": path must not contain a NUL character`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace path longer than the claim path limit",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": v1beta2TraceForAdmission(strings.Repeat("a", 1025))}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission(strings.Repeat("a", 1025))}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				"spec.workload.trace.source.pvc.path: Too long: may not be more than 1024 characters",
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace claim that is not a DNS subdomain",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": map[string]any{"format": "dynamo", "source": map[string]any{"pvc": map[string]any{"claimName": "Bad_Claim", "path": "w.jsonl"}}}}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": map[string]any{"format": "dynamo", "source": map[string]any{"pvc": map[string]any{"claimName": "Bad_Claim", "path": "w.jsonl"}}}}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload.trace.source.pvc.claimName: Invalid value: "Bad_Claim": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace format that is not admitted",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": map[string]any{"format": "mooncake", "source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "w.jsonl"}}}}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": map[string]any{"format": "mooncake", "source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "w.jsonl"}}}}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload.trace.format: Unsupported value: "mooncake": supported values: "dynamo"`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace without a format",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": map[string]any{"source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "w.jsonl"}}}}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": map[string]any{"source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "w.jsonl"}}}}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload.trace.format: Required value`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace source without a pvc",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": map[string]any{"format": "dynamo", "source": map[string]any{}}}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": map[string]any{"format": "dynamo", "source": map[string]any{}}}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload.trace.source.pvc: Required value`,
+			},
+			// CEL ratchets the unchanged trace and reports what it tolerated as a warning.
+			wantWarnings: []string{
+				`spec.workload.trace.source: Invalid value: "object": pvc is required`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace beside a static workload",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"static": map[string]any{}, "trace": map[string]any{"format": "dynamo", "source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "w.jsonl"}}}}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"static": map[string]any{}, "trace": map[string]any{"format": "dynamo", "source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "w.jsonl"}}}}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload: Forbidden: static and trace are mutually exclusive`,
+			},
+			// CEL ratchets the unchanged trace and reports what it tolerated as a warning.
+			wantWarnings: []string{
+				`spec.workload: Invalid value: "object": static and trace are mutually exclusive`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace arrival speedup that is not positive",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"trace": map[string]any{"format": "dynamo", "source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "w.jsonl"}}, "replay": map[string]any{"arrivalSpeedupRatio": 0.0}}}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": map[string]any{"format": "dynamo", "source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "w.jsonl"}}, "replay": map[string]any{"arrivalSpeedupRatio": 0.0}}}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload.trace.replay.arrivalSpeedupRatio: Invalid value: 0: must be greater than 0`,
+			},
+		},
+		{
+			name:       "v1beta2 carrier trace errors are reported together in field order",
+			oldRequest: v1beta1CarrierForAdmission(map[string]any{"static": map[string]any{}, "trace": map[string]any{"format": "mooncake", "source": map[string]any{"pvc": map[string]any{"claimName": "Bad_Claim", "path": "../w.jsonl"}}, "replay": map[string]any{"arrivalSpeedupRatio": -1.0}}}),
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"static": map[string]any{}, "trace": map[string]any{"format": "mooncake", "source": map[string]any{"pvc": map[string]any{"claimName": "Bad_Claim", "path": "../w.jsonl"}}, "replay": map[string]any{"arrivalSpeedupRatio": -1.0}}}
+			}),
+			seedWithoutWebhook: true,
+			gpuDiscovery:       true,
+			discovered:         discoveredH200,
+			wantWebhook: []string{
+				`spec.workload: Forbidden: static and trace are mutually exclusive`,
+				`spec.workload.trace.format: Unsupported value: "mooncake": supported values: "dynamo"`,
+				`spec.workload.trace.source.pvc.claimName: Invalid value: "Bad_Claim": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')`,
+				`spec.workload.trace.source.pvc.path: Invalid value: "../w.jsonl": path must be relative to the claim root without empty, '.' or '..' segments`,
+				`spec.workload.trace.replay.arrivalSpeedupRatio: Invalid value: -1: must be greater than 0`,
+			},
+			// CEL ratchets the unchanged trace and reports what it tolerated as a warning.
+			wantWarnings: []string{
+				`spec.workload: Invalid value: "object": static and trace are mutually exclusive`,
+				`spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+			},
+		},
+		{
+			name: "v1beta2 a trace leaves traffic overrides it does not own to AISimulate",
 			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
 				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("w.jsonl")}
 				setV1beta2InputOverrides(spec, map[string]any{"traffic": map[string]any{
-					"load": map[string]any{"speedup": 2.0},
-					"stop": map[string]any{"sessions_per_load_unit": nil, "max_virtual_time_seconds": 600},
+					"load":   map[string]any{"speedup": 2.0},
+					"source": map[string]any{"block_size": 64},
+					"stop":   map[string]any{"requests": 8},
 				}})
-			}),
-			gpuDiscovery: true,
-			discovered:   discoveredH200,
-		},
-		{
-			name: "v1beta2 a trace accepts a null stop override",
-			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
-				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("w.jsonl")}
-				setV1beta2InputOverrides(spec, map[string]any{"traffic": map[string]any{"stop": nil}})
 			}),
 			gpuDiscovery: true,
 			discovered:   discoveredH200,
@@ -886,33 +1069,6 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 			discovered:   discoveredH200,
 			wantWebhook: []string{
 				"spec.aisimulate.inputOverrides.traffic.source: Forbidden: is owned by spec.workload.trace and cannot be overridden",
-			},
-		},
-		{
-			name: "v1beta2 a trace accepts no non-object stop override",
-			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
-				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("w.jsonl")}
-				setV1beta2InputOverrides(spec, map[string]any{"traffic": map[string]any{"stop": []any{"requests"}}})
-			}),
-			gpuDiscovery: true,
-			discovered:   discoveredH200,
-			wantWebhook: []string{
-				"spec.aisimulate.inputOverrides.traffic.stop: Forbidden: must be an object or null",
-			},
-		},
-		{
-			name: "v1beta2 a trace accepts no count stop override",
-			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
-				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("w.jsonl")}
-				setV1beta2InputOverrides(spec, map[string]any{"traffic": map[string]any{
-					"stop": map[string]any{"requests_per_load_unit": 2.0, "sessions": 5},
-				}})
-			}),
-			gpuDiscovery: true,
-			discovered:   discoveredH200,
-			wantWebhook: []string{
-				"spec.aisimulate.inputOverrides.traffic.stop.requests_per_load_unit: Forbidden: a trace replays every recorded request; only max_virtual_time_seconds can stop it",
-				"spec.aisimulate.inputOverrides.traffic.stop.sessions: Forbidden: a trace replays every recorded request; only max_virtual_time_seconds can stop it",
 			},
 		},
 		{
@@ -1273,6 +1429,21 @@ func v1beta2DGDRForAdmission(mutate func(spec map[string]any)) *unstructured.Uns
 		"kind":       "DynamoGraphDeploymentRequest",
 		"metadata":   metadata,
 		"spec":       spec,
+	}}
+}
+
+// v1beta1CarrierForAdmission is a v1beta1 Request carrying a v1beta2 spec with workload under the
+// name v1beta2DGDRForAdmission uses. Only conversion writes such a carrier, so seed it without the
+// webhook.
+func v1beta1CarrierForAdmission(workload map[string]any) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "nvidia.com/v1beta1",
+		"kind":       "DynamoGraphDeploymentRequest",
+		"metadata":   map[string]any{"name": "test-v1beta2-dgdr", "namespace": "default"},
+		"spec": map[string]any{"v1beta2": map[string]any{
+			"model":    map[string]any{"name": v1beta2AdmissionModel},
+			"workload": workload,
+		}},
 	}}
 }
 

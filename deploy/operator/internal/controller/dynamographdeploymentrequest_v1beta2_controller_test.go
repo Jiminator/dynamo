@@ -32,7 +32,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -596,46 +598,53 @@ func TestV1beta2RequestControllerPreservesInputOverridesForRunLowering(t *testin
 	}
 }
 
-func TestV1beta2RequestControllerReportsAnInvalidTraceInsteadOfCreatingARun(t *testing.T) {
+func TestV1beta2RequestControllerReportsARunTheCRDRejectsInsteadOfRetryingIt(t *testing.T) {
+	invalid := apierrors.NewInvalid(
+		schema.GroupKind{Group: nvidiacomv1beta2.GroupVersion.Group, Kind: "DynamoGraphDeploymentRun"}, "search-1",
+		field.ErrorList{field.Invalid(field.NewPath("spec", "workload", "trace", "source", "pvc", "path"), "../escape.jsonl",
+			"path must be relative to the claim root without empty, '.' or '..' segments")},
+	)
 	tests := []struct {
 		name        string
-		tracePath   string
+		createErr   error
 		wantRuns    []string
 		wantReason  string
 		wantMessage string
 	}{
 		{
-			name:       "a valid trace is snapshotted into the Run",
-			tracePath:  "retune/w-1.jsonl.gz",
+			name:       "a Run the API server accepts is created",
 			wantRuns:   []string{"search-1"},
 			wantReason: dgdrReasonRunCreated,
 		},
 		{
-			name:        "a trace path that bypassed admission is reported once",
-			tracePath:   "../escape.jsonl",
+			name:        "a Run the CRD rejects is reported once as an invalid spec",
+			createErr:   invalid,
 			wantReason:  dgdrReasonInvalidSpec,
-			wantMessage: `spec.workload.trace.source.pvc.path: Invalid value: "../escape.jsonl"`,
+			wantMessage: invalid.Error(),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			request := dgdrV1beta2Request(true)
-			request.Spec.Workload = &nvidiacomv1beta2.WorkloadSpec{Trace: &nvidiacomv1beta2.TraceWorkloadSpec{
-				Format: nvidiacomv1beta2.TraceFormatDynamo,
-				Source: nvidiacomv1beta2.TraceSourceSpec{PVC: &nvidiacomv1beta2.TracePVCSource{
-					ClaimName: "request-traces", Path: tt.tracePath,
-				}},
-			}}
-			f := newDGDRV1beta2Fixture(t, request)
-			f.reconcile()
+			f := newDGDRV1beta2FixtureWithInterceptor(t, interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if _, ok := obj.(*nvidiacomv1beta2.DynamoGraphDeploymentRun); ok && tt.createErr != nil {
+						return tt.createErr
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+			}, dgdrV1beta2Request(true))
 
-			t.Log("Only a valid trace becomes a Run; an invalid one is a condition, not a retried create")
+			t.Log("An invalid spec is a condition, not a reconcile error that retries the create with backoff")
+			f.reconcile()
 			if names := f.runNames(); !slices.Equal(names, tt.wantRuns) {
 				t.Fatalf("runs = %v, want %v", names, tt.wantRuns)
 			}
 			condition := dgdrV1beta2AcceptedCondition(t, f.request())
-			if condition.Reason != tt.wantReason || !strings.HasPrefix(condition.Message, tt.wantMessage) {
-				t.Fatalf("Accepted = %+v, want reason %s and message prefix %q", condition, tt.wantReason, tt.wantMessage)
+			if condition.Reason != tt.wantReason {
+				t.Fatalf("Accepted = %+v, want reason %s", condition, tt.wantReason)
+			}
+			if tt.wantMessage != "" && condition.Message != tt.wantMessage {
+				t.Fatalf("Accepted message = %q, want %q", condition.Message, tt.wantMessage)
 			}
 		})
 	}
