@@ -18,6 +18,7 @@
 package validation_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -547,6 +548,47 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 		},
 
 		{
+			name: "v1beta2 unknown hardware without a budget recommends the manual override",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["hardware"] = map[string]any{"gpu": map[string]any{
+					"sku": "future_accelerator",
+				}}
+			}),
+			gpuDiscovery: true,
+			wantWebhook: []string{
+				`spec.hardware.gpu.budget: Required value: cannot discover a GPU budget for SKU "future_accelerator" because it is not known to the bundled AISimulate catalog; set spec.hardware.gpu.budget explicitly`,
+			},
+		},
+		{
+			name: "v1beta2 unknown explicit hardware is passed through with a warning",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["hardware"] = map[string]any{"gpu": map[string]any{
+					"sku": "future_accelerator", "budget": int64(4),
+				}}
+			}),
+			gpuDiscovery: true,
+			discoveryErr: errors.New("discovery must not run for complete explicit hardware"),
+			wantWarnings: []string{
+				`spec.hardware.gpu.sku: "future_accelerator" is not known to the AISimulate release bundled with this operator; the value is passed through unchanged and may work with an external AISimulate systems catalog`,
+			},
+			check: func(t *testing.T, result *unstructured.Unstructured) {
+				if got := v1beta2String(t, result, "spec", "hardware", "gpu", "sku"); got != "future_accelerator" {
+					t.Fatalf("spec.hardware.gpu.sku = %q, want unchanged override", got)
+				}
+			},
+		},
+		{
+			name: "v1beta2 bundled hardware does not warn",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["hardware"] = map[string]any{"gpu": map[string]any{
+					"sku": "h200_sxm", "budget": int64(4),
+				}}
+			}),
+			gpuDiscovery: true,
+			discoveryErr: errors.New("discovery must not run for complete explicit hardware"),
+		},
+
+		{
 			name: "v1beta2 public input overrides may configure non-reserved dgdr run fields",
 			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
 				setV1beta2InputOverrides(spec, map[string]any{"dgdr_run": map[string]any{
@@ -778,15 +820,23 @@ func TestDynamoGraphDeploymentRunSpecIsImmutable(t *testing.T) {
 			run:        v1beta2RunForAdmission(alternateAdmissionModel, nil),
 			wantCELErr: `<nil>: Invalid value: spec is immutable`,
 		},
+		{
+			name:       "model-only Run is rejected before controller reconciliation",
+			run:        v1beta2ModelOnlyRunForAdmission(v1beta2AdmissionModel),
+			wantCELErr: `spec: Invalid value: spec must be a fully resolved Request admission snapshot`,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := runAdmissionTest(t, admissionTestCase{
+			test := admissionTestCase{
 				object:       tt.run,
-				oldObject:    tt.oldRun,
 				wantCELError: tt.wantCELErr,
-			})
+			}
+			if tt.oldRun != nil {
+				test.oldObject = tt.oldRun
+			}
+			actual := runAdmissionTest(t, test)
 			if tt.wantCELErr == "" && actual.GetGeneration() != 1 {
 				t.Fatalf("generation = %d, want 1 for a metadata-only update", actual.GetGeneration())
 			}
@@ -989,14 +1039,32 @@ func beta2DGDRForAdmission(
 }
 
 func v1beta2RunForAdmission(model string, labels map[string]string) *nvidiacomv1beta2.DynamoGraphDeploymentRun {
+	metric := nvidiacomv1beta2.ObjectiveMetric("ThroughputPerGPU")
 	return &nvidiacomv1beta2.DynamoGraphDeploymentRun{
 		APIVersion: nvidiacomv1beta2.GroupVersion.String(),
 		Kind:       "DynamoGraphDeploymentRun",
 		Name:       "test-v1beta2-dgdr-run", Namespace: "default", Labels: labels,
 		Spec: nvidiacomv1beta2.DynamoGraphDeploymentRunSpec{NativeSearchInput: nvidiacomv1beta2.NativeSearchInput{
-			Model: &nvidiacomv1beta2.ModelSpec{Name: model},
+			Model:    &nvidiacomv1beta2.ModelSpec{Name: model},
+			Backends: []nvidiacomv1beta2.Backend{nvidiacomv1beta2.BackendVLLM},
+			Hardware: &nvidiacomv1beta2.HardwareSpec{GPU: &nvidiacomv1beta2.GPUHardwareSpec{
+				SKU: new("h200_sxm"), Budget: new(int32(8)),
+			}},
+			Workload: &nvidiacomv1beta2.WorkloadSpec{Static: &nvidiacomv1beta2.StaticWorkloadSpec{}},
+			Objective: &nvidiacomv1beta2.ObjectiveSpec{
+				Mode: nvidiacomv1beta2.ObjectiveModeOptimize, Metric: &metric, SLA: &nvidiacomv1beta2.ObjectiveSLASpec{},
+			},
+			Recommendation: &nvidiacomv1beta2.RecommendationSpec{MaxCandidates: 1},
 		}},
 	}
+}
+
+func v1beta2ModelOnlyRunForAdmission(model string) *nvidiacomv1beta2.DynamoGraphDeploymentRun {
+	run := v1beta2RunForAdmission(model, nil)
+	run.Spec.NativeSearchInput = nvidiacomv1beta2.NativeSearchInput{
+		Model: &nvidiacomv1beta2.ModelSpec{Name: model},
+	}
+	return run
 }
 
 const v1beta2AdmissionModel = "Qwen/Qwen3-0.6B"
