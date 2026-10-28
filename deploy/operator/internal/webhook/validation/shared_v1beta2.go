@@ -23,7 +23,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-// validateAISimulateSpec validates the Request's native AISimulate overrides.
+// validateNativeSearchInput validates the typed search fields. spec and fldPath must not be nil.
+// Schema and CEL own the remaining typed child rules; upstream input validation runs after lowering.
+func validateNativeSearchInput(spec *nvidiacomv1beta2.NativeSearchInput, fldPath *field.Path) field.ErrorList {
+	if spec.AISimulate != nil {
+		return validateAISimulateSpec(spec.AISimulate, fldPath.Child("aisimulate"))
+	}
+	return nil
+}
+
+// validateAISimulateSpec validates native AISimulate overrides. input and fldPath must not be nil.
 func validateAISimulateSpec(
 	input *nvidiacomv1beta2.AISimulateSpec,
 	fldPath *field.Path,

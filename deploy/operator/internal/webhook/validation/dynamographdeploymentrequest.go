@@ -123,7 +123,7 @@ func (v *dynamoGraphDeploymentRequestValidation) validateDynamoGraphDeploymentRe
 	// A v1beta2 Request reaches this webhook as a v1beta1 object carrying spec.v1beta2;
 	// the v1beta1 rules below do not apply to it.
 	if spec.V1Beta2 != nil {
-		return validateDynamoGraphDeploymentRequestEnvelopeV1beta2(spec.V1Beta2, nil, fldPath.Child("v1beta2"))
+		return dynamoGraphDeploymentRequestV1beta2Errors(spec.V1Beta2, nil, fldPath.Child("v1beta2"))
 	}
 
 	allErrs := field.ErrorList{}
@@ -290,7 +290,7 @@ func (v *dynamoGraphDeploymentRequestValidation) validateDynamoGraphDeploymentRe
 	// spec runs on every CREATE and UPDATE. Only the generated AISimulate schema check is
 	// ratcheted when the complete spec stays unchanged.
 	if newSpec.V1Beta2 != nil {
-		return validateDynamoGraphDeploymentRequestEnvelopeV1beta2(newSpec.V1Beta2, oldSpec.V1Beta2, fldPath.Child("v1beta2"))
+		return dynamoGraphDeploymentRequestV1beta2Errors(newSpec.V1Beta2, oldSpec.V1Beta2, fldPath.Child("v1beta2"))
 	}
 
 	allErrs := field.ErrorList{}
