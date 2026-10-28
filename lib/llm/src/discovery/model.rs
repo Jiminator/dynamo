@@ -88,6 +88,7 @@ pub(crate) struct GenerateEngineSelection {
     pub(crate) tower_connector_lora_enabled: bool,
     /// What the worker set advertises to its `/generate` format.
     pub(crate) engine_info: serde_json::Value,
+    pub(crate) output_parsers: Option<crate::request_trace::GenerateOutputParsers>,
 }
 
 /// Readiness facts for one namespace, from [`Model::evaluate_namespace`].
@@ -722,6 +723,11 @@ impl Model {
                         .get(crate::generate_format::ENGINE_INFO_KEY)
                         .cloned()
                         .unwrap_or_default(),
+                    output_parsers: crate::request_trace::GenerateOutputParsers::new(
+                        ws.tokenizer.clone(),
+                        ws.card().runtime_config.reasoning_parser.clone(),
+                        ws.card().runtime_config.tool_call_parser.clone(),
+                    ),
                 })
         })
         .ok_or_else(|| self.engine_error(self.has_generate_engine_for_capability(capability)))

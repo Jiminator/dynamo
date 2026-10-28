@@ -226,6 +226,8 @@ pub struct WorkerSet {
     pub(crate) tensor_engine: Option<TensorStreamingEngine>,
     pub(crate) realtime_engine: Option<RealtimeBidirectionalEngine>,
     pub(crate) generate_engine: Option<GenerateStreamingEngine>,
+    /// Tokenizer loaded for this set's local pipelines, reused to trace `/generate` output.
+    pub(crate) tokenizer: Option<crate::tokenizers::Tokenizer>,
 
     /// Owns load monitoring for routed surfaces that do not use `RoutingHost`.
     load_context: Option<Arc<RoutingLoadContext>>,
@@ -275,6 +277,7 @@ impl WorkerSet {
             tensor_engine: None,
             realtime_engine: None,
             generate_engine: None,
+            tokenizer: None,
             load_context: None,
             load_thresholds: None,
             prefill_router: None,
@@ -556,6 +559,7 @@ impl WorkerSet {
             // inject the adapter identity. Fail closed instead of serving the base weights.
             realtime_engine: None,
             generate_engine,
+            tokenizer: self.tokenizer.clone(),
             load_context: self.load_context.clone(),
             load_thresholds: self.load_thresholds.clone(),
             prefill_router: self.prefill_router.clone(),
