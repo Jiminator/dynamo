@@ -15,14 +15,12 @@ import (
 	"testing"
 	"time"
 
-	semver "github.com/Masterminds/semver/v3"
 	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
 	nvidiacomv1beta2 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta2"
 	commoncontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
-	"github.com/ai-dynamo/dynamo/deploy/operator/internal/gpu"
 	dynamotesting "github.com/ai-dynamo/dynamo/deploy/operator/internal/testing"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/testing/clusterenv"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/testing/golden"
@@ -332,11 +330,6 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 	}
 	plannerImage := clusterenv.RequireEnv(t, "DYNAMO_CLUSTERTEST_PROFILER_IMAGE")
 	operatorImage := clusterenv.RequireEnv(t, "DYNAMO_CLUSTERTEST_OPERATOR_IMAGE")
-	operatorVersion, err := clusterTestOperatorVersion()
-	require.NoError(t, err)
-	parsedOperatorVersion, err := semver.NewVersion(operatorVersion)
-	require.NoError(t, err)
-	dynamoVersion := fmt.Sprintf("%d.%d.%d", parsedOperatorVersion.Major(), parsedOperatorVersion.Minor(), parsedOperatorVersion.Patch())
 	for _, input := range inputs {
 		scenarioDir := filepath.Dir(input)
 		t.Run(filepath.Base(scenarioDir), func(t *testing.T) {
@@ -347,6 +340,14 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 
 			t.Log("Allow the AISimulate Job Pod to run while preventing unrelated ReplicaSet workloads")
 			env.BlockReplicaSets()
+
+			t.Log("Write a trace scenario's trace to its claim before the Request names it")
+			tracePath := filepath.Join(scenarioDir, "trace.jsonl")
+			traceBefore := ""
+			if _, err := os.Stat(tracePath); err == nil {
+				createClusterTestTraceClaim(t, env)
+				traceBefore = writeClusterTestTrace(t, env, tracePath, plannerImage)
+			}
 
 			t.Log("Apply the native v1beta2 Request through production admission")
 			objects := golden.ApplyManifests(t, filepath.Join(scenarioDir, "input.yaml"), env.Client(), env.Namespace())
@@ -365,32 +366,7 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 			require.NoError(t, err)
 			defer runWatch.Stop()
 
-			t.Log("Provide the Run controller the discovered node shape represented by the explicit Request hardware")
-			hardwareCache := gpu.NewGPUDiscoveryCache()
-			hardwareCache.Set(nvidiacomv1beta1.GPUSKUTypeH200SXM, &gpu.GPUInfo{
-				System:        nvidiacomv1beta1.GPUSKUTypeH200SXM,
-				GPUsPerNode:   8,
-				NodesWithGPUs: 1,
-				TotalGPUs:     8,
-			}, time.Hour)
-
-			t.Log("Start the production Request, Run, AISimulate Job, and publisher chain")
-			operatorConfig := clusterTestRestrictedConfig(env.Namespace())
-			runtimeConfig := &commoncontroller.RuntimeConfig{Gate: features.Gates{}}
-			env.StartManager(func(mgr ctrl.Manager) error {
-				setupOptions := SetupOptions{Config: operatorConfig, RuntimeConfig: runtimeConfig}
-				if err := SetupDynamoGraphDeploymentRequestV1beta2(mgr, setupOptions); err != nil {
-					return err
-				}
-				return SetupDynamoGraphDeploymentRunV1beta2(mgr, DynamoGraphDeploymentRunSetupOptions{
-					SetupOptions:            setupOptions,
-					GPUDiscoveryCache:       hardwareCache,
-					PlannerImage:            plannerImage,
-					DynamoVersion:           dynamoVersion,
-					OperatorImage:           operatorImage,
-					OperatorImagePullPolicy: corev1.PullIfNotPresent,
-				})
-			})
+			startClusterTestDGDRV1beta2Controllers(t, env, plannerImage, operatorImage)
 
 			t.Log("Observe the Run until the real AISimulate and publisher containers finish")
 			var completedRun nvidiacomv1beta2.DynamoGraphDeploymentRun
@@ -431,6 +407,12 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 
 			t.Log("Match the published Candidate API contract against the reviewed golden")
 			golden.EventuallyMatchManifests(t, env.Client(), env.Namespace(), filepath.Join(scenarioDir, "output.yaml"))
+
+			if traceBefore != "" {
+				t.Log("The Run replayed the mounted trace file and left its contents, owner and mode unchanged")
+				requireClusterTestTraceInput(t, &completedRun)
+				require.Equal(t, traceBefore, statClusterTestTrace(t, env, "trace-after", plannerImage))
+			}
 		})
 	}
 }
