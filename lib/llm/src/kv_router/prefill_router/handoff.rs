@@ -103,10 +103,8 @@ impl PrefillTask {
     }
 
     /// Observe prefill failures both during decode dispatch and while streaming.
-    /// Decode items, including a successful terminal, are forwarded without waiting for
-    /// prefill. A successful decode terminal means the request succeeded: decode cannot
-    /// succeed without its KV, so a later prefill failure is only logged, and the stream
-    /// closes once decode and prefill finish.
+    /// Successful decode terminals wait only for required prefill metadata.
+    /// After success, drain decode and await prefill cleanup; late failures are logged.
     /// `output` sends prefill's output into the stream as soon as prefill
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
     pub(super) async fn forward_decode(
@@ -116,7 +114,7 @@ impl PrefillTask {
         output: PrefillNeed,
         prefill_context: Arc<dyn AsyncEngineContext>,
     ) -> anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>> {
-        let emit = output != PrefillNeed::None;
+        let emit = output != PrefillNeed::None; // Prefill metadata, not generated tokens.
         let mut completion = Box::pin(self.wait());
         tokio::pin!(decode);
         let mut response = tokio::select! {
@@ -227,6 +225,7 @@ impl PrefillTask {
                         let terminal = output.as_ref().is_none_or(|output| {
                             output.data.as_ref().is_some_and(|data| data.finish_reason.is_some())
                         });
+                        // Metadata must precede the terminal; bare EOF must still surface prefill errors.
                         if terminal && (emit || output.is_none()) {
                             match completion.as_mut().await {
                                 Ok(prefill) => if emit && let Some(item) = output_item(prefill) {
@@ -245,10 +244,12 @@ impl PrefillTask {
                             None => return,
                         }
                         if terminal {
+                            // Consume the worker's stream completion before closing the response.
                             while let Some(output) = response.next().await {
                                 yield output;
                             }
                             if !emit {
+                                // Success is delivered; the prefill task logs late failures.
                                 let _ = completion.await;
                             }
                             return;
