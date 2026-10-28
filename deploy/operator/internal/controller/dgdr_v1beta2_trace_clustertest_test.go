@@ -308,15 +308,20 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2RefusesATraceSymlinkThatLeave
 	require.Equal(t, dgdrRunReasonTraceSourceUnavailable, condition.Reason)
 	require.Contains(t, condition.Message, `cannot be mounted: failed to prepare subPath for volumeMount "trace"`)
 
-	t.Log("The Run's Job is gone and no Candidate was published")
+	t.Log("No Candidate was published, and the completed Run deletes its Job")
 	var candidates nvidiacomv1beta2.DynamoGraphDeploymentCandidateList
 	require.NoError(t, env.Client().List(ctx, &candidates, client.InNamespace(env.Namespace())))
 	require.Empty(t, candidates.Items)
-	var jobs batchv1.JobList
-	require.NoError(t, env.Client().List(ctx, &jobs, client.InNamespace(env.Namespace())))
-	for i := range jobs.Items {
-		require.Falsef(t, metav1.IsControlledBy(&jobs.Items[i], &failed), "the Run's Job %q was not deleted", jobs.Items[i].Name)
-	}
+	require.Eventually(t, func() bool {
+		var jobs batchv1.JobList
+		require.NoError(t, env.Client().List(ctx, &jobs, client.InNamespace(env.Namespace())))
+		for i := range jobs.Items {
+			if metav1.IsControlledBy(&jobs.Items[i], &failed) {
+				return false
+			}
+		}
+		return true
+	}, time.Minute, time.Second, "the failed Run's Job was not deleted")
 }
 
 // startClusterTestDGDRV1beta2Controllers starts the production Request and Run controllers for env,

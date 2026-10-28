@@ -1587,6 +1587,20 @@ func TestV1beta2RunControllerDoesNotLetAStaleRunUndoATraceFailure(t *testing.T) 
 			if got := f.run(); !reflect.DeepEqual(got.Status, failed.Status) {
 				t.Fatalf("status = %+v, want the recorded failure %+v", got.Status, failed.Status)
 			}
+
+			t.Log("The next pass deletes the Job only if it has not finished, and keeps the failure")
+			f.reconcile()
+			if tt.jobCondition == "" {
+				assertDGDRRunFailedForTrace(t, f.client, f.run(), job.Name,
+					`trace PersistentVolumeClaim "request-traces" does not exist in namespace "default"`)
+				return
+			}
+			if kept := f.job(); kept.UID != job.UID {
+				t.Fatalf("Job UID = %q, want the finished Job %q kept", kept.UID, job.UID)
+			}
+			if got := f.run(); !reflect.DeepEqual(got.Status, failed.Status) {
+				t.Fatalf("status = %+v, want the recorded failure %+v", got.Status, failed.Status)
+			}
 		})
 	}
 }
