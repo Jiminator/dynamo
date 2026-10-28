@@ -1919,6 +1919,8 @@ impl ChoiceState {
     fn delta_to_choice(&mut self, index: u32, delta: UnifiedParserEvent) -> ChatChoiceStream {
         let mut choice = empty_choice(index);
         match delta {
+            // Message phases are opt-in; this adapter keeps the default flattened mode.
+            UnifiedParserEvent::MessageStart(_) | UnifiedParserEvent::MessageEnd => {}
             UnifiedParserEvent::Text(text) => {
                 choice.delta.content = Some(ChatCompletionMessageContent::Text(text));
             }
@@ -2403,6 +2405,8 @@ fn parse_complete_in_mode(
     let events = dynamo_parsers_v2::assemble(&output.events);
     for event in events {
         match event {
+            // Match the streaming adapter's flattened message mode.
+            UnifiedEvent::MessageStart { .. } | UnifiedEvent::MessageEnd => {}
             UnifiedEvent::Text { text: chunk } => text.push_str(&chunk),
             UnifiedEvent::Reasoning { text: chunk } => {
                 if policy.reasoning_disabled {
