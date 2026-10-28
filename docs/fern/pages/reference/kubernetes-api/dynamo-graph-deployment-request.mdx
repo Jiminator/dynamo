@@ -1122,7 +1122,10 @@ neither `null` nor an object. Overrides of `traffic.load` and
 `traffic.stop.max_virtual_time_seconds` still apply.
 
 If the claim does not exist, is being deleted, is a block volume, or has lost its volume, the Run
-fails before its Job is created, and its `Completed` condition has reason `TraceSourceUnavailable`.
+fails, and its `Completed` condition has reason `TraceSourceUnavailable`. The operator checks the
+claim before it creates the Job, and again whenever the claim changes until the Job's pod leaves the
+`Pending` phase. If the claim becomes unusable in that time, the operator deletes the Job before it
+fails the Run. Once the pod has left `Pending`, the Job alone decides the outcome.
 A claim that is still `Pending`, such as one that waits for its first consumer, is accepted. The request starts one Run per `metadata.generation`, so after you fix
 the claim, change the request's `spec` to start a new Run.
 

@@ -39,12 +39,15 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 )
 
 const (
 	dgdrRunJobControllerUIDIndex = ".metadata.dgdrRunControllerUID"
+	dgdrRunTraceClaimIndex       = ".spec.workload.trace.source.pvc.claimName"
 	dgdrRunMaxJobNameLength      = 63
 
 	dgdrRunInputKey                = "input.yaml"
@@ -112,10 +115,10 @@ type DynamoGraphDeploymentRunV1beta2Reconciler struct {
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentruns/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentcandidates,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentcandidates/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps;serviceaccounts,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch
 
@@ -143,12 +146,12 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) Reconcile(
 		job = &jobs[0]
 	}
 
-	// A Job that can never mount its trace would keep the Run active forever, so a Run that has not
-	// created its Job checks the claim before anything is discovered or created for it. A recorded
-	// jobRef, or a Job the API server already holds, means the Job was created even if the cache does
-	// not show it yet; that Job keeps driving the Run, whatever happens to the claim later.
+	// A Job that can never mount its trace would keep the Run active forever, so a Run without a Job
+	// checks the claim before anything is discovered or created for it. A Job the API server already
+	// holds is not missing even if the cache does not show it yet; it is checked below once it shows.
+	// A recorded jobRef does not skip the check: it outlives a Job deleted below.
 	resourceName := dgdrRunResourceName(run.Name)
-	if job == nil && run.Status.JobRef == nil {
+	if job == nil {
 		unavailable, err := r.traceSourceUnavailable(ctx, run)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -159,7 +162,30 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) Reconcile(
 				return ctrl.Result{}, err
 			}
 			if !created {
-				return ctrl.Result{}, r.failRunBeforeJob(ctx, run, dgdrRunReasonTraceSourceUnavailable, unavailable)
+				return ctrl.Result{}, r.failUnstartedRun(ctx, run, dgdrRunReasonTraceSourceUnavailable, unavailable)
+			}
+		}
+	}
+
+	// Until its pod starts, the Job still has to mount the claim, and a pod that cannot stays pending
+	// with nothing to end the Job. Such a Job is deleted and the Run fails. Claim events wake the Run
+	// for this check; once the pod has started, the Job alone decides the outcome.
+	if job != nil && dgdrRunTraceClaim(run) != nil {
+		started, err := r.jobPodStarted(ctx, job)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !started {
+			unavailable, err := r.traceSourceUnavailable(ctx, run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if unavailable != "" {
+				if err := r.deleteUnstartedJob(ctx, job); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, r.failUnstartedRun(ctx, run, dgdrRunReasonTraceSourceUnavailable,
+					fmt.Sprintf("%s; deleted Job %q before its pod started", unavailable, job.Name))
 			}
 		}
 	}
@@ -209,10 +235,10 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) ownedJobs(
 
 const dgdrRunReasonTraceSourceUnavailable = "TraceSourceUnavailable"
 
-// traceSourceUnavailable returns why a new Job could not mount the Run's trace claim, or "" when
-// it can or the Run replays no trace. The answer fails the Run terminally, so the claim is read
-// through the uncached API reader: a claim the cache has not observed yet must not end a Run, and
-// the Run controller watches no claims that could correct a cached miss later. A Pending claim is
+// traceSourceUnavailable returns why a Job could not mount the Run's trace claim, or "" when it
+// can or the Run replays no trace. The answer fails the Run terminally, so the claim is read
+// through the uncached API reader: claim events only wake the Run, and a claim the cache has not
+// observed yet, such as one created just before the Run, must not end it. A Pending claim is
 // accepted: a WaitForFirstConsumer claim binds only once its first pod is scheduled. Access modes
 // are not checked: whether another pod holds a ReadWriteOnce or ReadWriteOncePod claim is a
 // scheduling question, not a terminal one. Other read errors are returned for a retry.
@@ -220,10 +246,11 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) traceSourceUnavailable(
 	ctx context.Context,
 	run *nvidiacomv1beta2.DynamoGraphDeploymentRun,
 ) (string, error) {
-	if run.Spec.Workload == nil || run.Spec.Workload.Trace == nil || run.Spec.Workload.Trace.Source.PVC == nil {
+	source := dgdrRunTraceClaim(run)
+	if source == nil {
 		return "", nil
 	}
-	name := run.Spec.Workload.Trace.Source.PVC.ClaimName
+	name := source.ClaimName
 	claim := &corev1.PersistentVolumeClaim{}
 	err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, claim)
 	if apierrors.IsNotFound(err) {
@@ -268,9 +295,95 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) runJobExists(
 	return metav1.IsControlledBy(job, run), nil
 }
 
-// failRunBeforeJob completes a Run that cannot start, without a Job. The Job-driven status machine
-// never runs for it, because Reconcile stops at Completed=True.
-func (r *DynamoGraphDeploymentRunV1beta2Reconciler) failRunBeforeJob(
+// dgdrRunTraceClaim returns the claim the Run's trace is read from, or nil when it replays no trace.
+// run must not be nil.
+func dgdrRunTraceClaim(run *nvidiacomv1beta2.DynamoGraphDeploymentRun) *nvidiacomv1beta2.TracePVCSource {
+	if run.Spec.Workload == nil || run.Spec.Workload.Trace == nil {
+		return nil
+	}
+	return run.Spec.Workload.Trace.Source.PVC
+}
+
+// dgdrRunTraceClaimNames indexes a Run by the claim its trace is read from.
+func dgdrRunTraceClaimNames(obj client.Object) []string {
+	run, ok := obj.(*nvidiacomv1beta2.DynamoGraphDeploymentRun)
+	if !ok {
+		return nil
+	}
+	if source := dgdrRunTraceClaim(run); source != nil {
+		return []string{source.ClaimName}
+	}
+	return nil
+}
+
+// runsForTraceClaim maps a claim event to the Runs in the claim's namespace that read their trace
+// from it.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) runsForTraceClaim(ctx context.Context, claim client.Object) []reconcile.Request {
+	runs := &nvidiacomv1beta2.DynamoGraphDeploymentRunList{}
+	if err := r.List(ctx, runs, client.InNamespace(claim.GetNamespace()),
+		client.MatchingFields{dgdrRunTraceClaimIndex: claim.GetName()}); err != nil {
+		log.FromContext(ctx).Error(err, "Could not list the Runs that read a trace claim", "claim", claim.GetName())
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(runs.Items))
+	for i := range runs.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&runs.Items[i])})
+	}
+	return requests
+}
+
+// jobPodStarted reports whether job no longer needs to mount its volumes: its pod has left the
+// Pending phase, or the Job reports a ready or finished pod or a terminal condition. The Job runs
+// one pod, because its backoffLimit is 0. A pod never returns to Pending, unlike status.ready,
+// which drops to 0 again when one of the pod's containers exits. job must not be nil.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) jobPodStarted(ctx context.Context, job *batchv1.Job) (bool, error) {
+	// The Job's own status, which also covers a pod the cache no longer shows.
+	uncounted := job.Status.UncountedTerminatedPods
+	if ptr.Deref(job.Status.Ready, 0) > 0 || job.Status.Succeeded > 0 || job.Status.Failed > 0 ||
+		(uncounted != nil && len(uncounted.Succeeded)+len(uncounted.Failed) > 0) {
+		return true, nil
+	}
+	for _, conditionType := range []batchv1.JobConditionType{
+		batchv1.JobComplete, batchv1.JobFailed, batchv1.JobSuccessCriteriaMet, batchv1.JobFailureTarget,
+	} {
+		if condition := dgdrRunJobCondition(job, conditionType); condition != nil && condition.Status == corev1.ConditionTrue {
+			return true, nil
+		}
+	}
+
+	// The pod's phase, which stays past Pending once its volumes were mounted.
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{batchv1.JobNameLabel: job.Name}); err != nil {
+		return false, fmt.Errorf("list pods of Job %q: %w", job.Name, err)
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if metav1.IsControlledBy(pod, job) && pod.Status.Phase != "" && pod.Status.Phase != corev1.PodPending {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// deleteUnstartedJob deletes job, whose pod has not started, together with its pods. The
+// preconditions refuse to delete a Job that changed after the cache showed it, such as one whose pod
+// became ready since; the conflict is returned and retried against the newer Job. job must not be
+// nil.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) deleteUnstartedJob(ctx context.Context, job *batchv1.Job) error {
+	err := r.Delete(ctx, job,
+		client.PropagationPolicy(metav1.DeletePropagationBackground),
+		client.Preconditions{UID: &job.UID, ResourceVersion: &job.ResourceVersion},
+	)
+	if client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("delete Job %q: %w", job.Name, err)
+	}
+	return nil
+}
+
+// failUnstartedRun completes a Run whose Job never started a pod: none was created, or the controller
+// deleted it. The Job-driven status machine never runs for it again, because Reconcile stops at
+// Completed=True.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) failUnstartedRun(
 	ctx context.Context,
 	run *nvidiacomv1beta2.DynamoGraphDeploymentRun,
 	reason, message string,
@@ -813,12 +926,12 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) buildJob(
 
 	// Only AISimulate reads the trace. The whole claim is mounted read-only without a subPath,
 	// which the kubelet would have to create, at the directory aisimulate.TracePath resolves under.
-	if run.Spec.Workload != nil && run.Spec.Workload.Trace != nil && run.Spec.Workload.Trace.Source.PVC != nil {
+	if source := dgdrRunTraceClaim(run); source != nil {
 		pod := &job.Spec.Template.Spec
 		pod.Volumes = append(pod.Volumes, corev1.Volume{
 			Name: dgdrRunTraceVolume,
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: run.Spec.Workload.Trace.Source.PVC.ClaimName,
+				ClaimName: source.ClaimName,
 				ReadOnly:  true,
 			},
 		})
@@ -1000,6 +1113,11 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) SetupWithManager(mgr ctrl.Ma
 	); err != nil {
 		return fmt.Errorf("index Jobs by Run controller UID: %w", err)
 	}
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(), &nvidiacomv1beta2.DynamoGraphDeploymentRun{}, dgdrRunTraceClaimIndex, dgdrRunTraceClaimNames,
+	); err != nil {
+		return fmt.Errorf("index Runs by trace claim: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("dynamographdeploymentrun-v1beta2").
 		For(&nvidiacomv1beta2.DynamoGraphDeploymentRun{}).
@@ -1008,6 +1126,7 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) SetupWithManager(mgr ctrl.Ma
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
+		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.runsForTraceClaim)).
 		WithEventFilter(commoncontroller.EphemeralDeploymentEventFilter(r.Config, r.RuntimeConfig)).
 		Complete(r)
 }
