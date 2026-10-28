@@ -425,7 +425,7 @@ def test_planner_candidate_replay_is_identical_across_processes(tmp_path):
             _planner_candidate_report, [traces, traces]
         )
 
-    # Preconditions fail with their own message before the reports are compared.
+    # Verify both independent processes exercised the planner before comparing reports.
     if first_pid == second_pid:
         pytest.fail("both replays ran in one process")
     planner = json.loads(first)["planner"]
