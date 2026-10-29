@@ -4,7 +4,7 @@
 //! Opt-in replay recovery for a rank's ZMQ KV event listener.
 
 use super::PublisherInput;
-use super::zmq_listener::{is_mismatched_rank, normalize_batch};
+use super::zmq_listener::{is_mismatched_rank, normalize_batch, split_zmq_kv_batch};
 use crate::utils::zmq::multipart_message;
 use dynamo_kv_router::{protocols::*, zmq_wire::*};
 use dynamo_runtime::transports::zmq::ipv6_option_for;
@@ -23,24 +23,18 @@ enum ReplayFrame {
     End,
 }
 
-fn decode_replay(mut frames: Vec<Vec<u8>>) -> Result<ReplayFrame> {
-    // DEALER removes identity; SGLang omits the topic included by vLLM.
-    if !matches!(frames.len(), 3 | 4) || !frames[0].is_empty() {
+fn decode_replay(frames: Vec<Vec<u8>>) -> Result<ReplayFrame> {
+    // DEALER removes the identity, leaving delimiter, topic, sequence and payload.
+    let Ok([delimiter, _, sequence, payload]) = <[Vec<u8>; 4]>::try_from(frames) else {
         bail!("invalid KV replay envelope");
+    };
+    anyhow::ensure!(delimiter.is_empty(), "invalid KV replay envelope");
+    let sequence: [u8; 8] = sequence.as_slice().try_into()?;
+    match (sequence == (-1_i64).to_be_bytes(), payload.is_empty()) {
+        (true, true) => Ok(ReplayFrame::End),
+        (false, false) => Ok(ReplayFrame::Batch(u64::from_be_bytes(sequence), payload)),
+        _ => bail!("invalid KV replay end marker"),
     }
-    let payload = frames.pop().expect("envelope has a payload frame");
-    let sequence: [u8; 8] = frames
-        .pop()
-        .expect("envelope has a sequence frame")
-        .as_slice()
-        .try_into()?;
-    if sequence == (-1_i64).to_be_bytes() && payload.is_empty() {
-        return Ok(ReplayFrame::End);
-    }
-    if payload.is_empty() || sequence == (-1_i64).to_be_bytes() {
-        bail!("invalid KV replay end marker");
-    }
-    Ok(ReplayFrame::Batch(u64::from_be_bytes(sequence), payload))
 }
 
 /// Per-rank sequence cursor; history loss is inferred only from replay, never from a timeout.
@@ -154,6 +148,7 @@ fn fatal(error: impl Into<anyhow::Error>) -> RecoveryError {
 
 /// Caps both the live/replay merge buffer and one replay message.
 const MAX_REPLAY_BYTES: usize = 32 * 1024 * 1024;
+/// Only live batches that arrive ahead of replay wait in the merge buffer; a late reply never does.
 const MAX_PENDING_BATCHES: usize = 4096;
 const MAX_LIVE_DRAIN: usize = 4096;
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -184,15 +179,9 @@ async fn wait_for_handshake(monitor: &mut tmq::pair::Pair) -> Result<()> {
 
 /// Like ordinary live ingestion, an unreadable message is skipped; a later gap repairs it.
 fn live_batch(message: tmq::Multipart) -> Option<(u64, Vec<u8>)> {
-    let decoded = <[Vec<u8>; 3]>::try_from(multipart_message(message))
+    split_zmq_kv_batch(multipart_message(message))
+        .inspect_err(|error| tracing::warn!(%error, "Failed to decode ZMQ KV batch envelope"))
         .ok()
-        .and_then(|[_, sequence, payload]| {
-            Some((u64::from_be_bytes(sequence.try_into().ok()?), payload))
-        });
-    if decoded.is_none() {
-        tracing::warn!("Failed to decode ZMQ KV batch envelope");
-    }
-    decoded
 }
 
 /// Waits until the processor and index have finished every batch sent before it.
@@ -464,8 +453,9 @@ async fn recovery_session(
                 // A reply in an unknown format fails the same way on every attempt.
                 match decode_replay(multipart_message(message)).map_err(fatal)? {
                     ReplayFrame::Batch(sequence, payload) => {
-                        // A hole inside one reply is a transport drop; the next round re-requests it.
-                        is_reply_truncated |= replay_next.is_some_and(|next| next != sequence);
+                        // A hole inside one reply is a transport drop, and a reply that starts past the cursor
+                        // cannot apply yet; neither is buffered, and End confirms missing history or re-requests.
+                        is_reply_truncated |= replay_next.map_or(sequence > ingest.cursor.next(), |next| next != sequence);
                         replay_first.get_or_insert(sequence);
                         replay_next = Some(sequence.saturating_add(1));
                         if !is_reply_truncated {
@@ -833,17 +823,18 @@ mod socket_tests {
 
     #[tokio::test]
     async fn confirmed_missing_history_is_distinct_from_exhausted_retries() {
-        for (is_batch_sent, is_end_sent) in [(true, true), (true, false), (false, false)] {
+        for is_reply_sent in [true, false] {
             let mut f = Fixture::new(Duration::from_secs(1));
             let id = f.request(0).await;
-            if is_batch_sent {
-                f.send(&id, 500, payload(0)).await;
-            }
-            if is_end_sent {
+            if is_reply_sent {
+                // A late reply longer than the merge buffer, as from an engine whose buffer rolled over.
+                for sequence in 500..=500 + MAX_PENDING_BATCHES as i64 {
+                    f.send(&id, sequence, payload(0)).await;
+                }
                 f.send(&id, -1, vec![]).await;
             }
             let status = f.final_status().await;
-            if is_end_sent {
+            if is_reply_sent {
                 assert_eq!(
                     status,
                     KvStreamStatus::MissingHistory {
@@ -892,8 +883,12 @@ mod socket_tests {
         // Let replay expose the hole before its live counterpart arrives.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(f.live_events(0).await[0].event.event_id, 0);
-        assert_eq!(f.events().await[0].event.event_id, 1);
+        // The late reply was not buffered, so the rest is requested again once live fills the hole.
         f.send(&id, -1, vec![]).await;
+        let id = f.request(1).await;
+        f.send(&id, 1, payload(0)).await;
+        f.send(&id, -1, vec![]).await;
+        assert_eq!(f.events().await[0].event.event_id, 1);
         f.barrier().await;
         f.status(KvStreamStatus::Success).await;
     }
@@ -934,6 +929,7 @@ mod tests {
             ReplayFrame::End
         );
         assert!(decode_replay(vec![vec![], vec![], 0_u64.to_be_bytes().to_vec(), vec![]]).is_err());
+        assert!(decode_replay(vec![vec![], 0_u64.to_be_bytes().to_vec(), vec![1]]).is_err());
         assert!(decode_replay(vec![]).is_err());
     }
     #[test]
