@@ -2477,6 +2477,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamo-generate-format-catalog"
+version = "1.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.4",
+ "dynamo-llm",
+ "dynamo-runtime",
+ "dynamo-sglang-generate",
+ "dynamo-vllm-generate",
+ "futures",
+ "prometheus",
+ "serde_json",
+ "tokio",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "dynamo-global-common"
 version = "1.7.0"
 dependencies = [
@@ -3006,6 +3024,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamo-sglang-generate"
+version = "1.7.0"
+dependencies = [
+ "axum 0.8.4",
+ "base64 0.22.1",
+ "dynamo-llm",
+ "dynamo-protocols",
+ "dynamo-runtime",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "dynamo-sglang-mocker"
 version = "1.7.0"
 dependencies = [
@@ -3040,6 +3073,7 @@ dependencies = [
  "dynamo-kv-router",
  "dynamo-llm",
  "dynamo-runtime",
+ "dynamo-sglang-generate",
  "dynamo-sidecar-common",
  "futures",
  "prost 0.13.5",
@@ -3230,6 +3264,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamo-vllm-generate"
+version = "1.7.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.4",
+ "base64 0.22.1",
+ "dynamo-kv-router",
+ "dynamo-llm",
+ "dynamo-protocols",
+ "dynamo-runtime",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "dynamo-vllm-mocker"
 version = "1.7.0"
 dependencies = [
@@ -3269,6 +3319,7 @@ dependencies = [
  "dynamo-llm",
  "dynamo-runtime",
  "dynamo-sidecar-common",
+ "dynamo-vllm-generate",
  "futures",
  "prost-types 0.14.3",
  "reqwest 0.12.28",
