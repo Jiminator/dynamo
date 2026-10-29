@@ -114,6 +114,10 @@ and `backendFramework: sglang`. The leader declares `runtime`; worker placement
 depends on the engine topology. Other backends do not yet support operator-managed
 multinode sidecars. See the [SGLang guide](../../modular-components/backends/sglang/sidecar.md#deploy-on-kubernetes).
 
+Engine metrics stay in `main`. The platform chart's PodMonitor scrapes them only through an opt-in
+port named `engine-metrics`; see
+[Scrape Engine Metrics in Sidecar Mode](../../../../kubernetes/operations/observability.mdx#scrape-engine-metrics-in-sidecar-mode).
+
 ## Topologies
 
 Each engine page shows its single-node TP, multi-node TP, and multi-node DP

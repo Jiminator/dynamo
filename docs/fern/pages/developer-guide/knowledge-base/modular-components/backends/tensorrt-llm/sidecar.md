@@ -66,6 +66,17 @@ kubectl apply -f lib/sidecar/trtllm/deploy/agg.yaml -n <namespace>
 kubectl port-forward -n <namespace> svc/trtllm-sidecar-agg-frontend 8000:8000
 ```
 
+## Metrics
+
+In OpenEngine gRPC mode (`tensorrt_llm.commands.serve --grpc`), TensorRT-LLM does not serve HTTP
+metrics, so there is no engine endpoint to scrape and the example manifests declare no
+`engine-metrics` port. The Dynamo runtime's `dynamo_component_*` families on the `system` port are
+unaffected. Engine metrics become available when TensorRT-LLM serves `/prometheus/metrics` beside
+the gRPC server, tracked in
+[NVIDIA/TensorRT-LLM#21032](https://github.com/NVIDIA/TensorRT-LLM/issues/21032). The chart-side
+setup is in
+[Scrape Engine Metrics in Sidecar Mode](../../../../../kubernetes/operations/observability.mdx#scrape-engine-metrics-in-sidecar-mode).
+
 ## Topologies
 
 The frontend sends inference requests to each engine's leader sidecar, which forwards them to OpenEngine over gRPC and polls routing load for all attention-DP ranks. Each sidecar discovers its node's KV event sources through OpenEngine and relays local KV events through Dynamo's event plane. Follower sidecars do not serve inference requests.
